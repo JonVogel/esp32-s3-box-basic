@@ -17,9 +17,10 @@
  *   USB CDC On Boot: "Enabled"
  */
 
-#include <SPI.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_ST7789.h>
+#define LGFX_AUTODETECT
+#define LGFX_USE_V1
+#include <LovyanGFX.hpp>
+#include <LGFX_AUTODETECT.hpp>
 #include <LittleFS.h>
 #include <SD.h>
 #include "ti_font.h"
@@ -29,35 +30,29 @@
 #include "sprites.h"
 #include "line_editor.h"
 
-// LCD pins
+// LCD pins (ESP32-S3-Box-3, per esp-bsp/esp-box-3)
 #define LCD_DC    4
 #define LCD_CS    5
-#define LCD_SCLK  6
-#define LCD_MOSI  7
-#define LCD_RST   8
-#define LCD_BL    9
+#define LCD_SCLK  7
+#define LCD_MOSI  6
+#define LCD_RST   48    // through inverting level shifter U18A: GPIO HIGH = panel reset
+#define LCD_BL    47
 
-// Buttons
-#define BTN_OK    0
-#define BTN_UP   10
-#define BTN_DOWN 11
-#define BTN_MENU 14
+// Buttons (Box-3: only BOOT and MUTE on the mainboard)
+#define BTN_OK    0     // BOOT button — also used as pairing trigger
+#define BTN_MUTE  1     // MUTE switch (active low, gated through D-flip-flop)
 
-// LEDs
-#define LED_GREEN  15
-#define LED_YELLOW 16
-
-// Display geometry
-#define COLS       28
+// Display geometry — Box-3 panel is 320x240 landscape, full TI 32-col grid fits
+#define COLS       32
 #define ROWS       24
 #define CHAR_W     8
 #define CHAR_H     8
-#define SCREEN_W   240
+#define SCREEN_W   320
 #define SCREEN_H   240
 
-// Display offsets for centering/border
-#define DISPLAY_X_OFFSET 8
-#define DISPLAY_Y_OFFSET 16
+// Display offsets for centering — (320-32*8)/2 = 32, (240-24*8)/2 = 24
+#define DISPLAY_X_OFFSET 32
+#define DISPLAY_Y_OFFSET 24
 
 // Status bar at the bottom
 #define STATUS_Y   (DISPLAY_Y_OFFSET + ROWS * CHAR_H)
@@ -469,8 +464,10 @@ static int detokenizeLine(const uint8_t* tokens, int length, char* buf,
 // Display driver
 // ---------------------------------------------------------------------------
 
-SPIClass lcd_spi(FSPI);
-Adafruit_ST7789 tft(&lcd_spi, LCD_CS, LCD_DC, LCD_RST);
+// LovyanGFX's autodetect probes the SPI bus, identifies the panel chip
+// (ILI9342C on Box-3 V3), and configures pins, SPI host, backlight PWM,
+// and reset handling automatically.
+static LGFX tft;
 
 static int cursorCol = 0;
 static int cursorRow = 0;
@@ -512,19 +509,15 @@ static uint8_t screenColorIdx = 8;   // cyan by default
 
 static void initDisplay()
 {
-  // Keep backlight off until display is ready to prevent showing garbage
-  pinMode(LCD_BL, OUTPUT);
-  digitalWrite(LCD_BL, LOW);
-
-  lcd_spi.begin(LCD_SCLK, -1, LCD_MOSI, LCD_CS);
-  tft.init(240, 240, SPI_MODE0);
-  tft.setRotation(2);
+  tft.init();
+  tft.setRotation(1);            // landscape, USB on the right
+  tft.setColorDepth(16);
+  tft.setSwapBytes(true);        // pushImage data is little-endian uint16_t;
+                                 // panel wants big-endian RGB565.
+  tft.setBrightness(192);        // 0..255 backlight PWM duty
   tft.fillScreen(bgColor);
   tft.setTextSize(1);
   tft.setTextColor(fgColor, bgColor);
-
-  // Now turn backlight on
-  digitalWrite(LCD_BL, HIGH);
 }
 
 // Resolve a palette index to RGB565, with transparency (1) falling through
@@ -558,7 +551,8 @@ static void drawCell(int col, int row)
       bits <<= 1;
     }
   }
-  tft.drawRGBBitmap(px, py, pixBuf, 8, 8);
+  // LovyanGFX equivalent of Adafruit's drawRGBBitmap (note arg order swap)
+  tft.pushImage(px, py, 8, 8, pixBuf);
 }
 
 static void refreshScreen()
@@ -834,9 +828,10 @@ static void gfxSetCharColor(int charSet, int fg, int bg)
 // Fill the display: char area = bgColor, borders (outside 24 rows) = black.
 static void fillBackground(uint16_t bg)
 {
-  tft.fillScreen(0x0000);   // black everywhere first
-  tft.fillRect(DISPLAY_X_OFFSET, DISPLAY_Y_OFFSET,
-               COLS * CHAR_W, ROWS * CHAR_H, bg);
+  // Fill the entire panel with the screen color so the TI border (the
+  // area outside the 32x24 char grid) matches the screen color, as on a
+  // real TI-99/4A. The status bar repaints over the bottom strip later.
+  tft.fillScreen(bg);
 }
 
 // TI-Texas logo — 3×3 character grid taken straight from the TI title
@@ -906,10 +901,9 @@ static void showBootScreen()
   };
   const int numStripes = sizeof(stripes);
 
-  // Top and bottom colored bars: each stripe ~2 chars wide, 3 rows tall
-  // 15 stripes + 1 gap = 16 slots. The character area is 28 × 8 = 224
-  // pixels wide, so 224 / 16 = 14 pixels per slot fits exactly.
-  const int stripeW = 14;
+  // Top and bottom colored bars: 15 stripes + 1 gap = 16 slots spanning
+  // the full character-area width.
+  const int stripeW = (COLS * CHAR_W) / 16;
   const int stripeH = 24;        // 3 rows × 8px
   const int gapEnd  = 7 * stripeW;   // gap occupies slot 6 (after 6 stripes)
 
@@ -2251,9 +2245,8 @@ void setup()
   Serial.begin(115200);
   delay(500);
 
-  pinMode(LED_GREEN, OUTPUT);
-  pinMode(LED_YELLOW, OUTPUT);
-  digitalWrite(LED_GREEN, HIGH);
+  // Box-3 has no independently-driven user LEDs: D3 LED-GREEN tracks
+  // LCD_CTRL via U18B, so it lights automatically with the backlight.
 
   // Initialize LittleFS
   if (!LittleFS.begin(true))

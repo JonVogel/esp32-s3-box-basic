@@ -16,7 +16,7 @@ REM   build.bat monitor COM4
 
 setlocal enabledelayedexpansion
 
-set "DEFAULT_PORT=COM5"
+set "DEFAULT_PORT=COM19"
 set "ACTION=%~1"
 set "PORT_ARG=%~2"
 
@@ -34,7 +34,9 @@ if "!PORT_ARG!"=="" (
   set "PORT=!PORT_ARG!"
 )
 
-set "FQBN=esp32:esp32:esp32s3:PartitionScheme=custom,FlashSize=8M"
+REM Box-3 uses USB-Serial-JTAG (no on-board UART bridge), so CDCOnBoot=cdc
+REM is required to route Arduino's Serial.print() to USB.
+set "FQBN=esp32:esp32:esp32s3:PartitionScheme=custom,FlashSize=16M,CDCOnBoot=cdc"
 set "SKETCH_DIR=%~dp0"
 if "!SKETCH_DIR:~-1!"=="\" set "SKETCH_DIR=!SKETCH_DIR:~0,-1!"
 
