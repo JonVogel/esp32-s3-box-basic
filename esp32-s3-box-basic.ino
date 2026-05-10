@@ -696,8 +696,10 @@ static void gfxReset()
 {
   gfxResetColors();
   initCharPatterns();
-  // Redraw each cell in place — drawCell paints both bg and fg, so no
-  // fillScreen is needed. Avoids the cyan flash.
+  // Repaint the whole panel so the border drops the old CALL SCREEN
+  // color (drawCell only paints inside the 32x24 char grid). On the
+  // Box-3 SPI panel via LovyanGFX, the brief fill is unnoticeable.
+  fillBackground(bgColor);
   redrawScreen();
 }
 
@@ -722,9 +724,13 @@ static void gfxSetScreenColor(int colorIdx)
   if (colorIdx < 1 || colorIdx > 16) return;
   screenColorIdx = colorIdx;
   bgColor = tiPalette[colorIdx];
-  // Redraw each cell to pick up the new screen color (transparent bg chars
-  // resolve to this). drawCell fully paints each cell — no flash needed.
+  // Paint the entire panel including the border (area outside the
+  // 32x24 char grid), then redraw chars on top. Without the
+  // fillBackground call, the border keeps the old color even though
+  // the inner grid changes.
+  fillBackground(bgColor);
   redrawScreen();
+  spriteRedrawAll();
 }
 
 // CALL COLOR(set, fg, bg) — sets colors for a group of 8 characters.
@@ -3073,11 +3079,17 @@ void setup()
   // GPIO43 gates SD power through a P-FET (AO3401A), so it's ACTIVE LOW —
   // drive it LOW to turn the SD slot on. GPIO43 is U0TXD by default; with
   // CDCOnBoot=cdc the UART is unused, so we can repurpose this pin freely.
+  // Init the SD-MMC peripheral here, then hand the fs::FS to file_io so
+  // the shared file_io header stays hardware-agnostic across projects.
   pinMode(SD_PWR, OUTPUT);
   digitalWrite(SD_PWR, LOW);
   delay(50);
-  if (fio::beginSD(SD_CLK, SD_CMD, SD_D0))
+  SD_MMC.setPins(SD_CLK, SD_CMD, SD_D0);
+  if (SD_MMC.begin("/sdcard", /*mode1bit=*/true,
+                   /*format_if_mount_failed=*/false,
+                   /*sdmmc_frequency=*/20000))
   {
+    fio::setSDFs(&SD_MMC);
     Serial.println("SD card mounted.");
   }
   else
