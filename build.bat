@@ -46,9 +46,11 @@ if "!PORT_ARG!"=="" (
   set "PORT=!PORT_ARG!"
 )
 
-REM Box-3 uses USB-Serial-JTAG (no on-board UART bridge), so CDCOnBoot=cdc
-REM is required to route Arduino's Serial.print() to USB.
-set "FQBN=esp32:esp32:esp32s3:PartitionScheme=custom,FlashSize=16M,CDCOnBoot=cdc"
+REM Box-3 module is WROOM-1U-N16R16V: 16M flash, 16M octal PSRAM (1.8V),
+REM USB-Serial-JTAG (no UART bridge). PSRAM=opi enables the octal PSRAM
+REM so heap_caps_malloc(..., MALLOC_CAP_SPIRAM) works (sprites need this).
+REM CDCOnBoot=cdc routes Arduino's Serial.print() to USB.
+set "FQBN=esp32:esp32:esp32s3:PSRAM=opi,PartitionScheme=custom,FlashSize=16M,CDCOnBoot=cdc"
 set "SKETCH_DIR=%~dp0"
 if "!SKETCH_DIR:~-1!"=="\" set "SKETCH_DIR=!SKETCH_DIR:~0,-1!"
 
