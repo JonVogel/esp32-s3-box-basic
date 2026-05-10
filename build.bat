@@ -1,17 +1,20 @@
 @echo off
-REM Compile and upload TI Extended BASIC sketch to ESP32-S3-Box-3
+REM Compile and upload esp32-s3-box-basic sketch to ESP32-S3-Box-3
 REM
 REM Usage:
 REM   build.bat                   - compile + upload (default port)
 REM   build.bat compile           - compile only
-REM   build.bat upload            - upload only
+REM   build.bat upload            - upload only (auto-kills monitor first)
 REM   build.bat monitor           - open serial monitor
+REM   build.bat killmonitor       - terminate any lingering arduino-cli.exe
+REM                                 holding the COM port
 REM   build.bat all               - compile + upload + monitor
 REM
-REM Each form accepts an optional COM port:
+REM Each form accepts an optional COM port as the next arg (handy
+REM because Windows reassigns the port on every replug):
 REM   build.bat upload  COM23
 REM   build.bat all     COM7
-REM   build.bat         COM5     (compile+upload on COM5)
+REM   build.bat         COM5     (compile + upload on COM5)
 REM   build.bat monitor COM4
 
 setlocal enabledelayedexpansion
@@ -20,11 +23,20 @@ set "DEFAULT_PORT=COM19"
 set "ACTION=%~1"
 set "PORT_ARG=%~2"
 
+REM If the user passed only a COM port and no action, treat the first
+REM arg as the port instead. Match "COM" + digits (case-insensitive) so
+REM real action names like "compile" don't get misclassified as ports.
 if "!PORT_ARG!"=="" (
   set "FIRST=!ACTION!"
   if /i "!FIRST:~0,3!"=="COM" (
-    set "PORT_ARG=!ACTION!"
-    set "ACTION="
+    set "TAIL=!FIRST:~3!"
+    set "ISPORT=1"
+    for /f "delims=0123456789" %%a in ("!TAIL!") do set "ISPORT=0"
+    if "!TAIL!"=="" set "ISPORT=0"
+    if "!ISPORT!"=="1" (
+      set "PORT_ARG=!ACTION!"
+      set "ACTION="
+    )
   )
 )
 
@@ -41,13 +53,14 @@ set "SKETCH_DIR=%~dp0"
 if "!SKETCH_DIR:~-1!"=="\" set "SKETCH_DIR=!SKETCH_DIR:~0,-1!"
 
 echo.
-echo === build.bat (ti-basic-otg): action='!ACTION!' port='!PORT!' ===
+echo === build.bat (esp32-s3-box-basic): action='!ACTION!' port='!PORT!' ===
 
-if "!ACTION!"==""           goto compile_upload
-if /i "!ACTION!"=="compile" goto compile
-if /i "!ACTION!"=="upload"  goto upload
-if /i "!ACTION!"=="monitor" goto monitor
-if /i "!ACTION!"=="all"     goto all
+if "!ACTION!"==""               goto compile_upload
+if /i "!ACTION!"=="compile"     goto compile
+if /i "!ACTION!"=="upload"      goto upload
+if /i "!ACTION!"=="monitor"     goto monitor
+if /i "!ACTION!"=="killmonitor" goto killmonitor_action
+if /i "!ACTION!"=="all"         goto all
 goto compile_upload
 
 :compile
@@ -58,6 +71,7 @@ goto end
 
 :upload
 echo.
+call :killmonitor
 echo === Uploading to !PORT! ===
 arduino-cli upload -p !PORT! --fqbn !FQBN! "!SKETCH_DIR!"
 goto end
@@ -68,6 +82,7 @@ echo === Compiling ===
 arduino-cli compile --fqbn !FQBN! --libraries "!SKETCH_DIR!" "!SKETCH_DIR!"
 if errorlevel 1 goto end
 echo.
+call :killmonitor
 echo === Uploading to !PORT! ===
 arduino-cli upload -p !PORT! --fqbn !FQBN! "!SKETCH_DIR!"
 goto end
@@ -78,12 +93,18 @@ echo === Monitoring !PORT! (Ctrl+C to exit) ===
 arduino-cli monitor -p !PORT! --config baudrate=115200
 goto end
 
+:killmonitor_action
+echo.
+call :killmonitor
+goto end
+
 :all
 echo.
 echo === Compiling ===
 arduino-cli compile --fqbn !FQBN! --libraries "!SKETCH_DIR!" "!SKETCH_DIR!"
 if errorlevel 1 goto end
 echo.
+call :killmonitor
 echo === Uploading to !PORT! ===
 arduino-cli upload -p !PORT! --fqbn !FQBN! "!SKETCH_DIR!"
 if errorlevel 1 goto end
@@ -91,6 +112,31 @@ echo.
 echo === Monitoring !PORT! (Ctrl+C to exit) ===
 arduino-cli monitor -p !PORT! --config baudrate=115200
 goto end
+
+REM Kill any lingering serial-monitor process so the COM port is free
+REM for the upload step. Without this, an open monitor holds the port
+REM and the upload fails with "Access is denied".
+REM   arduino-cli.exe   -> `build.bat monitor` and Arduino IDE monitor
+REM   serial-monitor.exe -> VSCode's Serial Monitor extension
+:killmonitor
+set "_KILLED=0"
+tasklist /FI "IMAGENAME eq arduino-cli.exe" 2>nul | find /I "arduino-cli.exe" >nul
+if not errorlevel 1 (
+  echo Closing arduino-cli monitor on !PORT!...
+  taskkill /F /IM arduino-cli.exe >nul 2>&1
+  set "_KILLED=1"
+)
+tasklist /FI "IMAGENAME eq serial-monitor.exe" 2>nul | find /I "serial-monitor.exe" >nul
+if not errorlevel 1 (
+  echo Closing VSCode serial-monitor on !PORT!...
+  taskkill /F /IM serial-monitor.exe >nul 2>&1
+  set "_KILLED=1"
+)
+if "!_KILLED!"=="1" (
+  REM Brief settle so the OS releases the COM handle before upload
+  timeout /t 1 /nobreak >nul 2>&1
+)
+exit /b 0
 
 :end
 endlocal

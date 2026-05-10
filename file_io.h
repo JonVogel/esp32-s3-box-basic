@@ -15,7 +15,7 @@
 
 #include <Arduino.h>
 #include <LittleFS.h>
-#include <SD.h>
+#include <SD_MMC.h>
 #include <SPI.h>
 #include <FS.h>
 #include "dsk_image.h"
@@ -153,7 +153,7 @@ namespace fio
       m.mounted = false; m.spec[0] = '\0';
       return false;
     }
-    fs::FS& fs = fromFlash ? (fs::FS&)LittleFS : (fs::FS&)SD;
+    fs::FS& fs = fromFlash ? (fs::FS&)LittleFS : (fs::FS&)SD_MMC;
     if (!m.img.open(fs, fsPath))
     {
       m.mounted = false; m.spec[0] = '\0';
@@ -189,12 +189,16 @@ namespace fio
     return g_mounts[drive].spec;
   }
 
-  // Try to bring up the SD card. Caller should have already configured
-  // the SPI bus. Returns true on success.
-  inline bool beginSD(int cs = 10, int sck = 12, int miso = 13, int mosi = 11)
+  // Bring up the SD card via the native SD-MMC controller in 1-bit mode.
+  // Box-3's SENSOR board wires the TF slot to the chip's SDMMC peripheral
+  // (clk/cmd/d0 plus optional d1-d3 for 4-bit). 1-bit mode is the most
+  // compatible across cards and is plenty fast for our use case.
+  inline bool beginSD(int clk, int cmd, int d0)
   {
-    SPI.begin(sck, miso, mosi, cs);
-    g_sdOk = SD.begin(cs, SPI);
+    SD_MMC.setPins(clk, cmd, d0);
+    g_sdOk = SD_MMC.begin("/sdcard", /*mode1bit=*/true,
+                          /*format_if_mount_failed=*/false,
+                          /*sdmmc_frequency=*/20000);
     return g_sdOk;
   }
 
@@ -309,7 +313,7 @@ namespace fio
     }
     else
     {
-      fh = SD.open(path, openMode);
+      fh = SD_MMC.open(path, openMode);
     }
     if (!fh) return 6;
 

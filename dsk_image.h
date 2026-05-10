@@ -46,7 +46,7 @@
 #define DSK_IMAGE_H
 
 #include <Arduino.h>
-#include <SD.h>
+#include <SD_MMC.h>
 #include <FS.h>
 
 namespace dsk

@@ -22,7 +22,7 @@
 #include <LovyanGFX.hpp>
 #include <LGFX_AUTODETECT.hpp>
 #include <LittleFS.h>
-#include <SD.h>
+#include <SD_MMC.h>
 #include "ti_font.h"
 #include "ble_keyboard.h"
 #include "exec_manager.h"
@@ -41,6 +41,13 @@
 // Buttons (Box-3: only BOOT and MUTE on the mainboard)
 #define BTN_OK    0     // BOOT button — also used as pairing trigger
 #define BTN_MUTE  1     // MUTE switch (active low, gated through D-flip-flop)
+
+// SD card on the Box-3 SENSOR add-on board, native SD-MMC 1-bit mode.
+// Pins come from esp-bsp/esp-box-3.h's SD-MMC defines.
+#define SD_CLK   11     // BSP_SD_CLK
+#define SD_CMD   14     // BSP_SD_CMD
+#define SD_D0     9     // BSP_SD_D0
+#define SD_PWR   43     // BSP_SD_POWER — drive HIGH to power the SD slot
 
 // Display geometry — Box-3 panel is 320x240 landscape, full TI 32-col grid fits
 #define COLS       32
@@ -469,6 +476,7 @@ static int detokenizeLine(const uint8_t* tokens, int length, char* buf,
 // and reset handling automatically.
 static LGFX tft;
 
+
 static int cursorCol = 0;
 static int cursorRow = 0;
 
@@ -830,7 +838,7 @@ static void fillBackground(uint16_t bg)
 {
   // Fill the entire panel with the screen color so the TI border (the
   // area outside the 32x24 char grid) matches the screen color, as on a
-  // real TI-99/4A. The status bar repaints over the bottom strip later.
+  // real TI-99/4A.
   tft.fillScreen(bg);
 }
 
@@ -1078,11 +1086,9 @@ static void showBootScreen()
 
 static void showStatus(const char* msg)
 {
-  tft.fillRect(0, STATUS_Y, SCREEN_W, SCREEN_H - STATUS_Y, 0x18E3);
-  tft.setTextColor(0xFFFF, 0x18E3);
-  tft.setCursor(2, STATUS_Y + 2);
-  tft.print(msg);
-  tft.setTextColor(fgColor, bgColor);
+  // Status bar disabled on Box-3 — keep the messages on Serial only.
+  Serial.print("[status] ");
+  Serial.println(msg);
 }
 
 // Full-screen takeover while BLE pairing is active. The user
@@ -1903,22 +1909,129 @@ static void cmdMerge(const char* filename)
   printLine(msg);
 }
 
-static void cmdDir()
+// --- File-listing helpers ported from ti-extended-basic-esp32 ---
+// CAT/CATALOG/DIR pages output 23 lines at a time, prompts to continue,
+// and lets the user bail with ESC / Ctrl-C / Ctrl-L.
+static int  g_catLines     = 0;
+static bool g_catCancelled = false;
+static void catPrintLine(const char* s)
 {
-  File root = LittleFS.open("/");
-  File f = root.openNextFile();
-  if (!f)
+  if (g_catCancelled) return;
+  printLine(s);
+  g_catLines++;
+  if (g_catLines >= 23)
   {
-    printLine("  (no files)");
-  }
-  while (f)
-  {
-    char buf[48];
-    snprintf(buf, sizeof(buf), "  %-20s %d", f.name(), f.size());
-    printLine(buf);
-    f = root.openNextFile();
+    printLine("* PRESS ANY KEY TO CONTINUE *");
+    int c = -1;
+    while (c < 0)
+    {
+      bleKbTask();
+      yield();
+      c = editorReadChar();
+    }
+    if (c == 0x1B || c == 0x03 || c == 12) g_catCancelled = true;
+    g_catLines = 0;
   }
 }
+
+// DIR [device] — list files on a device.
+//   FLASH (default)  → internal LittleFS
+//   SDCARD or SD     → external SD on the SENSOR add-on
+//   DSK1..DSK9 / DSKA→ V9T9 disk-image catalog (mounted via MOUNT)
+static void cmdDirOn(const char* device)
+{
+  g_catLines = 0;
+  g_catCancelled = false;
+
+  if (strncasecmp(device, "DSK", 3) == 0 &&
+      (device[4] == '\0' || device[4] == ' ') &&
+      fio::driveFromChar(device[3]) > 0)
+  {
+    int drive = fio::driveFromChar(device[3]);
+    dsk::DskImage* img = fio::dskImage(drive);
+    if (!img)
+    {
+      printError("* NOT MOUNTED");
+      return;
+    }
+    char hdr[48];
+    snprintf(hdr, sizeof(hdr), "DSK%c  %s  %d FREE",
+             fio::driveToChar(drive), img->vib().name,
+             img->freeSectors());
+    catPrintLine(hdr);
+    catPrintLine("FILENAME    TYPE      SIZE");
+
+    dsk::DskImage::CatEntry ents[64];
+    int n = img->listCatalog(ents, 64);
+    for (int i = 0; i < n && !g_catCancelled; i++)
+    {
+      const auto& e = ents[i];
+      char typeStr[12];
+      if (e.flags & 0x01)
+      {
+        snprintf(typeStr, sizeof(typeStr), "PROGRAM");
+      }
+      else
+      {
+        const char* k1 = (e.flags & 0x02) ? "INT" : "DIS";
+        const char* k2 = (e.flags & 0x40) ? "VAR" : "FIX";
+        snprintf(typeStr, sizeof(typeStr), "%s/%s %d", k1, k2, e.recLen);
+      }
+      char lock = (e.flags & 0x08) ? 'P' : ' ';
+      char buf[40];
+      snprintf(buf, sizeof(buf), "%-10s %c %-10s %4d",
+               e.name, lock, typeStr, e.totalSectors);
+      catPrintLine(buf);
+    }
+    if (n == 0) catPrintLine("  (empty)");
+    return;
+  }
+
+  fs::FS* fsRef = nullptr;
+  const char* label = "FLASH";
+  if (strcasecmp(device, "SDCARD") == 0 || strcasecmp(device, "SD") == 0)
+  {
+    if (!fio::g_sdOk)
+    {
+      printError("* DEVICE NOT PRESENT");
+      return;
+    }
+    fsRef = &SD_MMC;
+    label = "SDCARD";
+  }
+  else
+  {
+    fsRef = &LittleFS;
+    label = "FLASH";
+  }
+
+  char hdr[32];
+  snprintf(hdr, sizeof(hdr), "%s:", label);
+  catPrintLine(hdr);
+
+  File root = fsRef->open("/");
+  File f = root.openNextFile();
+  int shown = 0;
+  while (f && !g_catCancelled)
+  {
+    const char* name = f.name();
+    bool hide = f.isDirectory() || name[0] == '.' ||
+                strcasecmp(name, "System Volume Information") == 0;
+    if (!hide)
+    {
+      char buf[48];
+      snprintf(buf, sizeof(buf), "  %-20s %d", name, (int)f.size());
+      catPrintLine(buf);
+      shown++;
+    }
+    f = root.openNextFile();
+  }
+  if (shown == 0) catPrintLine("  (no files)");
+}
+
+// Wrapper for the (currently unused) tokenized TOK_DIR path. Pre-tokenize
+// dispatch in processInput calls cmdDirOn directly with the parsed device.
+static void cmdDir() { cmdDirOn("FLASH"); }
 
 // SIZE — print free memory, TI-style. Real TI reported stack + program
 // space separately; we approximate with free heap (for stack/vars) and
@@ -2109,37 +2222,249 @@ static void readJoystick(int unit, int* outX, int* outY)
   *outY = bleGpJoystickY(unit);
 }
 
-// --- cmdContinue / cmdDelete stubs to round out the command set ---
 static void cmdContinue() { em.cont(); }
 
+// DELETE [device.]name — device-aware delete.
+//   FLASH.NAME      → /NAME on LittleFS
+//   SDCARD.NAME     → /NAME on SD
+//   DSKn.NAME       → file inside mounted V9T9 image
+//   bare NAME       → /NAME.bas on LittleFS (legacy SAVE convention)
 static void cmdDelete(const char* filename)
 {
-  if (!filename || !filename[0])
+  if (!filename || filename[0] == '\0')
   {
     printError("* BAD FILE NAME");
     return;
   }
-  // FLASH-only delete for the OTG variant. The full main-build
-  // version handles SDCARD. and DSKn. prefixes too.
-  char path[48];
-  if (filename[0] == '/')
+
+  fio::Device dev = fio::DEV_NONE;
+  char innerPath[48];
+  int drive = 0;
+  if (fio::parseSpec(filename, dev, innerPath, sizeof(innerPath), drive))
   {
-    snprintf(path, sizeof(path), "%s", filename);
-  }
-  else
-  {
-    snprintf(path, sizeof(path), "/%s.bas", filename);
-  }
-  if (LittleFS.remove(path))
-  {
-    char msg[64];
-    snprintf(msg, sizeof(msg), "DELETED: %s", path);
+    bool ok = false;
+    char label[56];
+    if (dev == fio::DEV_FLASH)
+    {
+      ok = LittleFS.exists(innerPath) && LittleFS.remove(innerPath);
+      snprintf(label, sizeof(label), "FLASH%s", innerPath);
+    }
+    else if (dev == fio::DEV_SD)
+    {
+      if (!fio::g_sdOk)
+      {
+        printError("* DEVICE NOT PRESENT");
+        return;
+      }
+      ok = SD_MMC.exists(innerPath) && SD_MMC.remove(innerPath);
+      snprintf(label, sizeof(label), "SDCARD%s", innerPath);
+    }
+    else if (dev == fio::DEV_DSK)
+    {
+      dsk::DskImage* img = fio::dskImage(drive);
+      if (!img)
+      {
+        printError("* NOT MOUNTED");
+        return;
+      }
+      if (img->readOnly())
+      {
+        printError("* WRITE PROTECTED");
+        return;
+      }
+      ok = img->deleteFile(innerPath);
+      snprintf(label, sizeof(label), "DSK%c.%s",
+               fio::driveToChar(drive), innerPath);
+    }
+    if (!ok)
+    {
+      printError("* FILE ERROR");
+      return;
+    }
+    char msg[72];
+    snprintf(msg, sizeof(msg), "DELETED: %s", label);
     printLine(msg);
+    return;
   }
-  else
+
+  // Legacy: bare name → /NAME.bas on LittleFS (matches SAVE / OLD)
+  char path[48];
+  snprintf(path, sizeof(path), "/%s.bas", filename);
+  if (!LittleFS.exists(path) || !LittleFS.remove(path))
   {
     printError("* FILE ERROR");
+    return;
   }
+  char msg[64];
+  snprintf(msg, sizeof(msg), "DELETED: %s", path);
+  printLine(msg);
+}
+
+// --- V9T9 .dsk mount table persistence ---
+// /mounts.cfg on LittleFS — three lines, one per drive; blank = unmounted.
+static void saveMounts()
+{
+  File f = LittleFS.open("/mounts.cfg", "w");
+  if (!f) return;
+  for (int d = 1; d <= fio::MAX_DSK; d++)
+  {
+    f.println(fio::dskImagePath(d));
+  }
+  f.close();
+}
+
+static void loadMounts()
+{
+  File f = LittleFS.open("/mounts.cfg", "r");
+  if (!f) return;
+  for (int d = 1; d <= fio::MAX_DSK && f.available(); d++)
+  {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() > 0)
+    {
+      fio::mountDskImage(d, line.c_str());
+    }
+  }
+  f.close();
+}
+
+// MOUNT DSK<n> <spec>
+//   <spec> forms accepted:
+//     FLASH.FILE.DSK    — internal LittleFS
+//     SDCARD.FILE.DSK   — external SD card
+//     /FILE.DSK         — absolute SD path (legacy)
+//     FILE              — bare name, .DSK auto-appended, SD card
+static void cmdMount(int drive, const char* imageName)
+{
+  if (drive < 1 || drive > fio::MAX_DSK)
+  {
+    printError("* BAD DEVICE");
+    return;
+  }
+  if (!fio::mountDskImage(drive, imageName))
+  {
+    int reason = fio::g_mounts[drive].img.openReason;
+    const char* why = (reason == 1) ? "* OPEN FAILED" :
+                      (reason == 2) ? "* READ FAILED" :
+                      (reason == 3) ? "* BAD VIB" :
+                                      "* MOUNT FAILED";
+    printError(why);
+    return;
+  }
+  saveMounts();
+  char msg[64];
+  snprintf(msg, sizeof(msg), "DSK%c = %s  [%s  %d sectors]",
+           fio::driveToChar(drive), imageName,
+           fio::g_mounts[drive].img.vib().name,
+           fio::g_mounts[drive].img.vib().totalSectors);
+  printLine(msg);
+}
+
+// NEWDISK <device.name> "VOLNAME" [SSSD|DSSD|DSDD]
+// Creates a fresh V9T9 disk image at the given LittleFS or SD location.
+static void cmdNewDisk(const char* spec, const char* volName,
+                       int totalSectors)
+{
+  if (!spec || !spec[0])
+  {
+    printError("* BAD FILE NAME");
+    return;
+  }
+
+  bool fromFlash;
+  char fsPath[48];
+  if (!fio::resolveMountSpec(spec, fromFlash, fsPath, sizeof(fsPath)))
+  {
+    printError("* BAD DEVICE");
+    return;
+  }
+  if (!fromFlash && !fio::g_sdOk)
+  {
+    printError("* DEVICE NOT PRESENT");
+    return;
+  }
+  fs::FS& fsTarget = fromFlash ? (fs::FS&)LittleFS : (fs::FS&)SD_MMC;
+
+  // Y/N overwrite confirmation
+  if (fsTarget.exists(fsPath))
+  {
+    char warn[64];
+    snprintf(warn, sizeof(warn), "* %s EXISTS. OVERWRITE? (Y/N)", spec);
+    printLine(warn);
+    int c = 0;
+    do
+    {
+      c = editorReadChar();
+      bleKbTask();
+      yield();
+    } while (c < 0);
+    if (c != 'Y' && c != 'y')
+    {
+      printLine("CANCELLED");
+      return;
+    }
+    fsTarget.remove(fsPath);
+  }
+
+  if (!dsk::DskImage::create(fsTarget, fsPath, volName, totalSectors))
+  {
+    printError("* CREATE FAILED");
+    return;
+  }
+  // Box-3's SPI panel does not have the RGB-DMA tearing issue that
+  // ti-extended-basic-esp32's RGB panel had during flash erases, so we
+  // skip the paintBorder() / redrawScreen() recovery the main repo does.
+  char msg[64];
+  const char* sizeLabel = (totalSectors == 360)  ? "SSSD" :
+                          (totalSectors == 720)  ? "DSSD" : "DSDD";
+  snprintf(msg, sizeof(msg), "CREATED %s %s [%s  %d sectors]",
+           sizeLabel, spec, volName, totalSectors);
+  printLine(msg);
+}
+
+// COPY <src-spec> <dst-spec>
+// Line-level copy between FLASH, SDCARD, and mounted DSK drives.
+static void cmdCopy(const char* src, const char* dst)
+{
+  if (fio::openFile(5, src, fio::MODE_INPUT) != 0)
+  {
+    printError("* SOURCE OPEN FAILED");
+    return;
+  }
+  if (fio::openFile(6, dst, fio::MODE_OUTPUT) != 0)
+  {
+    fio::closeFile(5);
+    printError("* DEST OPEN FAILED");
+    return;
+  }
+  int lines = 0;
+  char line[MAX_STR_LEN];
+  while (!fio::isEof(5))
+  {
+    if (fio::readLineFrom(5, line, sizeof(line)) != 0) break;
+    fio::printLineTo(6, line);
+    lines++;
+  }
+  fio::closeFile(6);
+  fio::closeFile(5);
+  char msg[48];
+  snprintf(msg, sizeof(msg), "COPIED %d LINES", lines);
+  printLine(msg);
+}
+
+static void cmdUnmount(int drive)
+{
+  if (drive < 1 || drive > fio::MAX_DSK)
+  {
+    printError("* BAD DEVICE");
+    return;
+  }
+  fio::unmountDskImage(drive);
+  saveMounts();
+  char msg[32];
+  snprintf(msg, sizeof(msg), "DSK%c UNMOUNTED", fio::driveToChar(drive));
+  printLine(msg);
 }
 
 // ---------------------------------------------------------------------------
@@ -2173,10 +2498,178 @@ static void processInput(const char* input)
     cmdRun();
     return;
   }
-  if (strncasecmp(&input[pos], "DIR", 3) == 0 &&
-      (input[pos + 3] == '\0' || input[pos + 3] == ' '))
+  // CAT[ALOG] / DIR — list files on a device (defaults to FLASH).
+  // TI-style: CATALOG is the conventional name; DIR is kept as a habit alias.
   {
-    cmdDir();
+    int kwLen = 0;
+    if (strncasecmp(&input[pos], "CATALOG", 7) == 0 &&
+        (input[pos + 7] == '\0' || input[pos + 7] == ' '))
+    {
+      kwLen = 7;
+    }
+    else if (strncasecmp(&input[pos], "CAT", 3) == 0 &&
+             (input[pos + 3] == '\0' || input[pos + 3] == ' '))
+    {
+      kwLen = 3;
+    }
+    else if (strncasecmp(&input[pos], "DIR", 3) == 0 &&
+             (input[pos + 3] == '\0' || input[pos + 3] == ' '))
+    {
+      kwLen = 3;
+    }
+    if (kwLen > 0)
+    {
+      int p = pos + kwLen;
+      while (input[p] == ' ') p++;
+      cmdDirOn(input[p] == '\0' ? "FLASH" : &input[p]);
+      return;
+    }
+  }
+  // MOUNT [DSK<n> <image>] — bare MOUNT lists currently-mounted drives.
+  if (strncasecmp(&input[pos], "MOUNT", 5) == 0 &&
+      (input[pos + 5] == '\0' || input[pos + 5] == ' '))
+  {
+    int p = pos + 5;
+    while (input[p] == ' ') p++;
+    if (input[p] == '\0')
+    {
+      int shown = 0;
+      for (int d = 1; d <= fio::MAX_DSK; d++)
+      {
+        if (!fio::g_mounts[d].mounted) continue;
+        char buf[64];
+        snprintf(buf, sizeof(buf), "DSK%c = %s",
+                 fio::driveToChar(d), fio::g_mounts[d].spec);
+        printLine(buf);
+        shown++;
+      }
+      if (shown == 0) printLine("(no disks mounted)");
+      return;
+    }
+    int drive = 0;
+    if (strncasecmp(&input[p], "DSK", 3) == 0)
+    {
+      drive = fio::driveFromChar(input[p + 3]);
+    }
+    if (drive == 0)
+    {
+      printError("* BAD DEVICE");
+      return;
+    }
+    p += 4;
+    while (input[p] == ' ') p++;
+    if (input[p] == '"')
+    {
+      p++;
+      char name[48]; int n = 0;
+      while (input[p] && input[p] != '"' && n < (int)sizeof(name) - 1)
+      {
+        name[n++] = input[p++];
+      }
+      name[n] = '\0';
+      cmdMount(drive, name);
+    }
+    else if (input[p] != '\0')
+    {
+      cmdMount(drive, &input[p]);
+    }
+    else
+    {
+      printError("* BAD FILE NAME");
+    }
+    return;
+  }
+  // UNMOUNT DSK<n>
+  if (strncasecmp(&input[pos], "UNMOUNT", 7) == 0 &&
+      (input[pos + 7] == '\0' || input[pos + 7] == ' '))
+  {
+    int p = pos + 7;
+    while (input[p] == ' ') p++;
+    int drive = 0;
+    if (strncasecmp(&input[p], "DSK", 3) == 0)
+    {
+      drive = fio::driveFromChar(input[p + 3]);
+    }
+    if (drive == 0)
+    {
+      printError("* BAD DEVICE");
+      return;
+    }
+    cmdUnmount(drive);
+    return;
+  }
+  // NEWDISK <spec> "VOLNAME" [SSSD|DSSD|DSDD]
+  if (strncasecmp(&input[pos], "NEWDISK", 7) == 0 &&
+      (input[pos + 7] == '\0' || input[pos + 7] == ' '))
+  {
+    int p = pos + 7;
+    while (input[p] == ' ') p++;
+
+    char spec[48] = {0};
+    int n = 0;
+    while (input[p] && input[p] != ' ' && input[p] != ',' &&
+           n < (int)sizeof(spec) - 1)
+    {
+      spec[n++] = input[p++];
+    }
+    spec[n] = '\0';
+
+    char volName[12] = "NEWDISK";
+    while (input[p] == ' ' || input[p] == ',') p++;
+    if (input[p] == '"')
+    {
+      p++;
+      n = 0;
+      while (input[p] && input[p] != '"' && n < (int)sizeof(volName) - 1)
+      {
+        char c = input[p++];
+        if (c >= 'a' && c <= 'z') c -= 32;
+        volName[n++] = c;
+      }
+      volName[n] = '\0';
+      if (input[p] == '"') p++;
+    }
+
+    int totalSectors = 360;   // SSSD default
+    while (input[p] == ' ' || input[p] == ',') p++;
+    if (strncasecmp(&input[p], "DSSD", 4) == 0) totalSectors = 720;
+    else if (strncasecmp(&input[p], "DSDD", 4) == 0) totalSectors = 1440;
+
+    cmdNewDisk(spec, volName, totalSectors);
+    return;
+  }
+  // COPY <src> <dst>
+  if (strncasecmp(&input[pos], "COPY", 4) == 0 &&
+      (input[pos + 4] == '\0' || input[pos + 4] == ' '))
+  {
+    int p = pos + 4;
+    while (input[p] == ' ') p++;
+
+    char src[48] = {0};
+    int n = 0;
+    while (input[p] && input[p] != ' ' && input[p] != ',' &&
+           n < (int)sizeof(src) - 1)
+    {
+      src[n++] = input[p++];
+    }
+    src[n] = '\0';
+
+    while (input[p] == ' ' || input[p] == ',') p++;
+
+    char dst[48] = {0};
+    n = 0;
+    while (input[p] && input[p] != ' ' && n < (int)sizeof(dst) - 1)
+    {
+      dst[n++] = input[p++];
+    }
+    dst[n] = '\0';
+
+    if (!src[0] || !dst[0])
+    {
+      printError("* BAD FILE NAME");
+      return;
+    }
+    cmdCopy(src, dst);
     return;
   }
 
@@ -2257,6 +2750,26 @@ void setup()
   {
     Serial.println("LittleFS mounted.");
   }
+
+  // Bring up SD card on the Box-3 SENSOR add-on board (if present).
+  // GPIO43 gates SD power through a P-FET (AO3401A), so it's ACTIVE LOW —
+  // drive it LOW to turn the SD slot on. GPIO43 is U0TXD by default; with
+  // CDCOnBoot=cdc the UART is unused, so we can repurpose this pin freely.
+  pinMode(SD_PWR, OUTPUT);
+  digitalWrite(SD_PWR, LOW);
+  delay(50);
+  if (fio::beginSD(SD_CLK, SD_CMD, SD_D0))
+  {
+    Serial.println("SD card mounted.");
+  }
+  else
+  {
+    Serial.println("SD card mount failed (no SENSOR board, or no card inserted).");
+  }
+
+  // Restore any DSK<n> mounts from /mounts.cfg on LittleFS so that
+  // `MOUNT` state survives reboots.
+  loadMounts();
 
   initDisplay();
   initCharPatterns();
