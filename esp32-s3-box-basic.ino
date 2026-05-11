@@ -22,6 +22,7 @@
 #include <LovyanGFX.hpp>
 #include <LGFX_AUTODETECT.hpp>
 #include <esp_heap_caps.h>
+#include "audio.h"
 #include <LittleFS.h>
 #include <SD_MMC.h>
 #include "ti_font.h"
@@ -656,6 +657,8 @@ static void printError(const char* str)
   printLine(str);
   printLine("");
   Serial.write(0x07);
+  // TI-authentic "HONK" — short 220 Hz buzz on any error.
+  tiSoundPlay(200, 220, 0, 0, 30, 0, 30, 0, 30);
 }
 
 void tiClearScreen()
@@ -1015,6 +1018,9 @@ static void showBootScreen()
   while (Serial.available()) { Serial.read(); delay(2); }
   while (bleKbAvailable())   { bleKbRead();  delay(2); }
 
+  // TI-authentic key-acknowledge beep: F6 (1397 Hz) for 166 ms.
+  tiSoundPlay(166, 1397, 0, 0, 30, 0, 30, 0, 30);
+
   // Clear and show the menu screen
   fillBackground(tiPalette[8]);
   for (int r = 0; r < ROWS; r++)
@@ -1089,14 +1095,17 @@ static void showBootScreen()
   while (Serial.available()) { Serial.read(); delay(2); }
   while (bleKbAvailable())   { bleKbRead();  delay(2); }
 
+  // TI-authentic key-acknowledge beep on 1/2 selection too.
+  tiSoundPlay(166, 1397, 0, 0, 30, 0, 30, 0, 30);
+
   tiClearScreen();
 }
 
-static void showStatus(const char* msg)
+static void showStatus(const char* /*msg*/)
 {
-  // Status bar disabled on Box-3 — keep the messages on Serial only.
-  Serial.print("[status] ");
-  Serial.println(msg);
+  // No-op on Box-3 — the bottom status strip was removed, and Serial
+  // output was too noisy in the monitor. Callers still pass formatted
+  // status strings; we just drop them.
 }
 
 // Full-screen takeover while BLE pairing is active. The user
@@ -3122,6 +3131,7 @@ void setup()
   loadMounts();
 
   initDisplay();
+  initAudio();
   initCharPatterns();
   gfxResetColors();
 
