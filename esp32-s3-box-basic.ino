@@ -2499,6 +2499,24 @@ void tiSpriteErase(int n)
   if (sprites::validSlot(n)) spriteErase(sprites::g_sprites[n]);
 }
 
+// Strong overrides for CALL PAIR / CALL UNPAIR — bridge into BleHidHost.
+void tiPair()
+{
+  BleHidHost::requestPairingMode();
+}
+
+void tiUnpair()
+{
+  BleHidHost::requestUnpairAll();
+}
+
+// `BLE` shell command — prints the bonded-peer table to the BASIC console
+// for diagnosing pairing / reconnect issues from inside BASIC.
+static void cmdBle()
+{
+  BleHidHost::describePeers(printLine);
+}
+
 // 60 Hz integration of sprite velocity. Each velocity unit is 1/8 of
 // a TI pixel per frame, so a 16 ms tick advances by vel/8. Sprites
 // that crossed a pixel boundary get erased and redrawn at their new
@@ -2849,6 +2867,14 @@ static void processInput(const char* input)
       (input[pos + 3] == '\0' || input[pos + 3] == ' '))
   {
     cmdRun();
+    return;
+  }
+  // BLE — list bonded HID peers and current pairing-mode state.
+  // Diagnostic only; the actual pairing trigger is CALL PAIR.
+  if (strncasecmp(&input[pos], "BLE", 3) == 0 &&
+      (input[pos + 3] == '\0' || input[pos + 3] == ' '))
+  {
+    cmdBle();
     return;
   }
   // CAT[ALOG] / DIR — list files on a device (defaults to FLASH).
