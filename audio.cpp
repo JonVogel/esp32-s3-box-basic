@@ -189,24 +189,29 @@ static bool i2s_init_tx()
 }
 
 // ---------------------------------------------------------------------------
-// One LFSR step. SN76489 uses a 16-bit LFSR with taps at 0 and 3 (XOR
-// feedback). Output bit is bit 0; in periodic mode the LFSR is replaced
-// by a single bit rotating around (so output is a steady square pulse
-// at the clock divider rate).
+// One LFSR step.
+//   White-noise mode: 16-bit Galois LFSR with primitive-polynomial mask
+//   0xB400 (taps at 0, 2, 3, 5). Maximal period 65535, no dead state as
+//   long as the seed is non-zero. The earlier hand-rolled XOR-feedback
+//   variant locked into the all-zeros absorbing state after ~16 shifts.
+//   Periodic mode: rotate bit 0 back to bit 15 — output is a steady
+//   square pulse at the clock-divider rate (the classic TI "drum-ish"
+//   periodic noise).
+// Output is +1 / -1 from the bit that gets shifted out, suitable for
+// summing directly into the mixer.
 // ---------------------------------------------------------------------------
 static inline int8_t lfsr_step()
 {
   uint16_t out = g_lfsr & 1;
-  uint16_t fb;
   if (g_noise_white)
   {
-    fb = ((g_lfsr) ^ (g_lfsr >> 3)) & 1;
+    g_lfsr >>= 1;
+    if (out) g_lfsr ^= 0xB400;
   }
   else
   {
-    fb = out;   // periodic: feed bit 0 back so we cycle a single bit
+    g_lfsr = (g_lfsr >> 1) | (out << 15);
   }
-  g_lfsr = (g_lfsr >> 1) | (fb << 15);
   return out ? +1 : -1;
 }
 
@@ -389,50 +394,57 @@ void tiSoundPlay(int duration,
 
   portENTER_CRITICAL(&g_audio_mux);
 
-  // Tone voices 1..3
+  // Reset all voices; we'll fill them by routing argument pairs below.
   for (int i = 0; i < 3; i++)
   {
-    if (freqs[i] >= 110 && freqs[i] <= 40000)
-    {
-      g_tone[i].step    = step_from_freq(freqs[i]);
-      g_tone[i].vol_idx = sn_index_from_ti_vol(vols[i]);
-    }
-    else
-    {
-      g_tone[i].step    = 0;
-      g_tone[i].vol_idx = 15;
-    }
+    g_tone[i].step    = 0;
+    g_tone[i].vol_idx = 15;
   }
+  g_noise.vol_idx     = 15;
+  g_noise.step        = 0;
+  g_noise_clock_voice = -1;
 
-  // Voice 4 = noise (frequency in -1..-8 selects noise type).
-  if (freqs[3] < 0 && freqs[3] >= -8)
+  // Route by sign — not by argument position. On real TI Extended BASIC
+  // the noise voice can be the 1st, 2nd, 3rd or 4th (freq, vol) pair;
+  // negative freq (-1..-8) marks it as noise, positive freq is a tone.
+  // E.g. CALL SOUND(-50,-5,V) is a single noise-voice call (no tones).
+  int tone_idx = 0;
+  for (int i = 0; i < 4; i++)
   {
-    g_noise.vol_idx = sn_index_from_ti_vol(vols[3]);
-    int t = freqs[3];
-    g_noise_white = (t >= -8 && t <= -5);
-    if (t == -4 || t == -8)
+    int f = freqs[i];
+    if (f == 0) continue;                         // unused / silent slot
+
+    if (f < 0 && f >= -8)
     {
-      // Clock from tone voice 3
-      g_noise_clock_voice = 2;
-      g_noise.step        = 0;
+      // Noise voice — type selects clock division and LFSR mode.
+      g_noise.vol_idx = sn_index_from_ti_vol(vols[i]);
+      // White noise: -5..-8.  Periodic noise: -1..-4.
+      g_noise_white = (f >= -8 && f <= -5);
+      if (f == -4 || f == -8)
+      {
+        // Clock the noise from tone voice 3.
+        g_noise_clock_voice = 2;
+        g_noise.step        = 0;
+      }
+      else
+      {
+        // Periodic divisions: -1/-5 → 256, -2/-6 → 512, -3/-7 → 1024.
+        int abs_t  = -f;
+        int divisor = 256;
+        if (abs_t == 2 || abs_t == 6) divisor = 512;
+        if (abs_t == 3 || abs_t == 7) divisor = 1024;
+        // SN76489 master clock ≈ 3.579545 MHz, then /16 internal pre-div.
+        double freq = 3579545.0 / (16.0 * divisor);
+        g_noise.step = step_from_freq((int)freq);
+      }
     }
-    else
+    else if (f >= 110 && f <= 40000 && tone_idx < 3)
     {
-      g_noise_clock_voice = -1;
-      // Periodic divisions: -1/-5: 256, -2/-6: 512, -3/-7: 1024
-      int divisor = 256;
-      int abs_t = (t < 0) ? -t : t;
-      if (abs_t == 2 || abs_t == 6) divisor = 512;
-      if (abs_t == 3 || abs_t == 7) divisor = 1024;
-      // SN76489 master clock is typically 3.579545 MHz; scale to our SR.
-      double freq = 3579545.0 / (16.0 * divisor);  // /16 internal pre-div
-      g_noise.step = step_from_freq((int)freq);
+      // Tone voice — fill the next available tone slot in order.
+      g_tone[tone_idx].step    = step_from_freq(f);
+      g_tone[tone_idx].vol_idx = sn_index_from_ti_vol(vols[i]);
+      tone_idx++;
     }
-  }
-  else
-  {
-    g_noise.vol_idx = 15;
-    g_noise.step    = 0;
   }
 
   unsigned long absDur = (duration >= 0) ? duration : -duration;

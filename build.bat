@@ -6,6 +6,8 @@ REM   build.bat                   - compile + upload (default port)
 REM   build.bat compile           - compile only
 REM   build.bat upload            - upload only (auto-kills monitor first)
 REM   build.bat monitor           - open serial monitor
+REM   build.bat run               - upload + monitor (skips compile;
+REM                                 use after `build.bat compile`)
 REM   build.bat killmonitor       - terminate any lingering arduino-cli.exe
 REM                                 holding the COM port
 REM   build.bat all               - compile + upload + monitor
@@ -62,6 +64,7 @@ if /i "!ACTION!"=="compile"     goto compile
 if /i "!ACTION!"=="upload"      goto upload
 if /i "!ACTION!"=="monitor"     goto monitor
 if /i "!ACTION!"=="killmonitor" goto killmonitor_action
+if /i "!ACTION!"=="run"         goto run
 if /i "!ACTION!"=="all"         goto all
 goto compile_upload
 
@@ -98,6 +101,17 @@ goto end
 :killmonitor_action
 echo.
 call :killmonitor
+goto end
+
+:run
+echo.
+call :killmonitor
+echo === Uploading to !PORT! ===
+arduino-cli upload -p !PORT! --fqbn !FQBN! "!SKETCH_DIR!"
+if errorlevel 1 goto end
+echo.
+echo === Monitoring !PORT! (Ctrl+C to exit) ===
+arduino-cli monitor -p !PORT! --config baudrate=115200
 goto end
 
 :all
