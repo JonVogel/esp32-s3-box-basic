@@ -48,6 +48,47 @@
 //   α = 2π·fc / (SR + 2π·fc) for fc = 5000, SR = 44100  ≈  0.416
 static const float LPF_ALPHA = 0.416f;
 
+// PolyBLEP residual at a unit step discontinuity. Used to antialias the
+// sharp transitions of the tone voices' square waves; without it,
+// harmonics of high-frequency tones fold back into the audio band as
+// faint inharmonic squeals at our 44.1 kHz sample rate. Reference:
+// Välimäki, "Antialiasing Oscillators in Subtractive Synthesis."
+//
+//   t  in [0..1)  : normalized phase
+//   dt in (0..1)  : per-sample normalized step
+static inline float poly_blep(float t, float dt)
+{
+  if (t < dt)
+  {
+    t /= dt;
+    return t + t - t * t - 1.0f;
+  }
+  if (t > 1.0f - dt)
+  {
+    t = (t - 1.0f) / dt;
+    return t * t + t + t + 1.0f;
+  }
+  return 0.0f;
+}
+
+// Bandlimited square wave at the given phase / step. Output is in [-1, +1]
+// before any volume scaling. PolyBLEP smooths the two discontinuities per
+// cycle (at phase=0 falling edge and phase=0.5 rising edge).
+static inline float bandlimited_square(uint32_t phase, uint32_t step)
+{
+  // Convert 32-bit fixed-point phase / step to normalized [0..1).
+  const float INV_2POW32 = 1.0f / 4294967296.0f;
+  float t  = (float)phase * INV_2POW32;
+  float dt = (float)step  * INV_2POW32;
+
+  float naive = (phase & 0x80000000u) ? +1.0f : -1.0f;
+  float corr_down = poly_blep(t, dt);                   // falling edge at t=0
+  float t2 = t + 0.5f;
+  if (t2 >= 1.0f) t2 -= 1.0f;
+  float corr_up   = poly_blep(t2, dt);                  // rising edge at t=0.5
+  return naive - corr_down + corr_up;
+}
+
 // ---------------------------------------------------------------------------
 // SN76489 16-step volume table (16-bit signed, peak ±32767).
 // 0 dB, then -2 dB per step until silence.
@@ -240,26 +281,28 @@ static void audioTask(void* /*arg*/)
 
     for (int i = 0; i < DMA_FRAMES; i++)
     {
-      int32_t mix = 0;
+      float mix = 0.0f;
 
-      // Tone voices
+      // Tone voices — bandlimited squares via PolyBLEP. Without this,
+      // harmonics above Nyquist fold back into the audio band as faint
+      // inharmonic squeals on high-pitch tones.
       for (int v = 0; v < 3; v++)
       {
         Voice& vc = g_tone[v];
         if (vc.vol_idx >= 15 || vc.step == 0) continue;
         vc.phase += vc.step;
-        int16_t amp = SN_VOL[vc.vol_idx];
-        // Square: sign from MSB of phase
-        mix += (vc.phase & 0x80000000u) ? +amp : -amp;
+        float amp = (float)SN_VOL[vc.vol_idx];
+        mix += bandlimited_square(vc.phase, vc.step) * amp;
       }
 
       // Noise voice — clocked either by its own step OR by tone voice 3.
+      // No bandlimiting: white noise is broadband by design and periodic
+      // noise is supposed to sound buzzy.
       if (g_noise.vol_idx < 15)
       {
         bool clock_tick = false;
         if (g_noise_clock_voice == 2)
         {
-          // Clocked by voice 3's edges (phase MSB transitions).
           static uint32_t last_phase_msb = 0;
           uint32_t cur = g_tone[2].phase & 0x80000000u;
           if (cur != last_phase_msb)
@@ -279,25 +322,25 @@ static void audioTask(void* /*arg*/)
         }
         static int8_t noise_out = +1;
         if (clock_tick) noise_out = lfsr_step();
-        mix += noise_out * SN_VOL[g_noise.vol_idx];
+        mix += (float)(noise_out * SN_VOL[g_noise.vol_idx]);
       }
 
-      // Headroom: scale by 1/3 so up to 3 simultaneously-active tone
-      // voices at full SN volume sum cleanly inside int16 range. Without
-      // this, multi-voice CALL SOUND hard-clips and sounds like a fuzz
-      // pedal. Side effect: single-voice tones are 1/3 quieter — bump
-      // the DAC volume register (0x32) upward if that's a problem.
-      float mix_scaled = (float)mix * (1.0f / 3.0f);
+      // Headroom: scale by 1/3 so 3 simultaneous voices at full SN
+      // volume sit below the soft-limit's knee. tanh handles whatever
+      // does exceed full scale gracefully.
+      mix *= (1.0f / 3.0f);
 
-      // 1-pole low-pass — softens square edges so the small speaker can
-      // actually reproduce the wave instead of breaking up.
-      lpf_y += LPF_ALPHA * (mix_scaled - lpf_y);
-      int32_t filtered = (int32_t)lpf_y;
+      // 1-pole low-pass — finishes the job PolyBLEP started on tone
+      // voices, and smooths the noise voice's hard clock edges.
+      lpf_y += LPF_ALPHA * (mix - lpf_y);
 
-      // Clip & duplicate to L+R (should rarely trigger now)
-      if (filtered >  32767) filtered =  32767;
-      if (filtered < -32768) filtered = -32768;
-      int16_t s = (int16_t)filtered;
+      // tanh soft-limit — replaces hard int16 clipping. Real SN76489's
+      // analog output stage compressed overshoots gracefully; tanh
+      // mimics that, so multi-voice peaks roll off into compression
+      // instead of squaring into harsh distortion.
+      float normalized = lpf_y * (1.0f / 32767.0f);
+      int16_t s = (int16_t)(tanhf(normalized) * 32767.0f);
+
       buf[i * 2 + 0] = s;
       buf[i * 2 + 1] = s;
     }
