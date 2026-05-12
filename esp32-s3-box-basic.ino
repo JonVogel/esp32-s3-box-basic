@@ -27,6 +27,17 @@
 #include <SD_MMC.h>
 #include <Preferences.h>
 #include "ti_font.h"
+
+// TI Speech Synthesizer cartridge ROM bake. Generated locally from a
+// user-supplied spchrom.bin via TI_Speech/extract.py. The file is
+// gitignored (copyrighted TI material); without it, CALL SAY / CALL
+// SPGET silently fall back to no-op stubs (compile still succeeds).
+#if __has_include("TI_Speech/speech_rom.h")
+  #include "TI_Speech/speech_rom.h"
+  #define HAVE_SPEECH_ROM 1
+#else
+  #define HAVE_SPEECH_ROM 0
+#endif
 #include "ble_keyboard.h"
 #include "exec_manager.h"
 #include "file_io.h"
@@ -2535,27 +2546,131 @@ static void cmdBle()
   BleHidHost::describePeers(printLine);
 }
 
-// CALL SAY / CALL SPGET — speech synth host stubs (stage 1).
+// CALL SAY / CALL SPGET — speech synth host implementation.
 //
-// The interpreter calls these whenever BASIC executes CALL SAY or
-// CALL SPGET. Stage 1 just acknowledges the calls on Serial so we can
-// verify the interpreter wiring without a synth wired up yet. The real
-// TMS5220 + spchrom.bin lookup lands in stage 2.
+// Stage 2a: real vocabulary lookup against the TI Speech Synthesizer
+// cartridge ROM (spchrom.bin baked into TI_Speech/speech_rom.h via
+// extract.py). Looks up word names in the cartridge's binary search
+// tree and returns the LPC byte sequence for each phrase.
+//
+// Stage 2b/c (next session): port the TMS5220 LPC-10 synthesizer from
+// MAME and wire its output to the I²S audio mixer. Until then, tiSay
+// resolves words to LPC data and logs what it would speak — no sound.
+
+#if HAVE_SPEECH_ROM
+// Walk the vocabulary binary search tree to find a word.
+// Format (see TI_Speech/README.md):
+//   [1B nameLen][N bytes ASCII name][2B prev BE][2B next BE]
+//   [1B pad][2B dataOffset BE][1B dataLen]
+// Root lives at offset 1 (offset 0 is the 0xAA marker). Leaves have
+// prev = next = 0. Returns true and fills outDataOffset/outDataLen on
+// hit; returns false on miss.
+static bool speechRomLookup(const char* word,
+                            uint16_t* outDataOffset,
+                            uint8_t* outDataLen)
+{
+  uint16_t offset = 1;   // root
+  while (offset != 0 && offset + 1 < SPEECH_ROM_SIZE)
+  {
+    uint8_t nameLen = pgm_read_byte(&speechRom[offset]);
+    if (nameLen == 0 || nameLen > 24) return false;   // sentinel / corrupt
+
+    char name[25];
+    for (uint8_t i = 0; i < nameLen; i++)
+    {
+      name[i] = (char)pgm_read_byte(&speechRom[offset + 1 + i]);
+    }
+    name[nameLen] = '\0';
+
+    int cmp = strcasecmp(word, name);
+
+    uint16_t descOff = offset + 1 + nameLen;
+    if (descOff + 7 >= SPEECH_ROM_SIZE) return false;
+
+    if (cmp == 0)
+    {
+      *outDataOffset =
+        ((uint16_t)pgm_read_byte(&speechRom[descOff + 5]) << 8) |
+                   pgm_read_byte(&speechRom[descOff + 6]);
+      *outDataLen = pgm_read_byte(&speechRom[descOff + 7]);
+      return true;
+    }
+
+    uint16_t prev =
+      ((uint16_t)pgm_read_byte(&speechRom[descOff]) << 8) |
+                 pgm_read_byte(&speechRom[descOff + 1]);
+    uint16_t next =
+      ((uint16_t)pgm_read_byte(&speechRom[descOff + 2]) << 8) |
+                 pgm_read_byte(&speechRom[descOff + 3]);
+    offset = (cmp < 0) ? prev : next;
+  }
+  return false;
+}
+#endif   // HAVE_SPEECH_ROM
+
 void tiSay(const char* wordStr, const uint8_t* phraseBytes, int phraseLen)
 {
-  Serial.printf("tiSay: words=\"%s\" phrase=%d bytes\n",
+#if HAVE_SPEECH_ROM
+  // Split wordStr on spaces, commas, periods. For each token, look up
+  // its LPC data offset/length in the vocab tree. Until the synth is
+  // wired (stage 2b), just log what we'd queue.
+  if (wordStr && *wordStr)
+  {
+    char buf[128];
+    strncpy(buf, wordStr, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+    char* tok = strtok(buf, " ,.");
+    while (tok)
+    {
+      uint16_t dataOff = 0;
+      uint8_t  dataLen = 0;
+      if (speechRomLookup(tok, &dataOff, &dataLen))
+      {
+        Serial.printf("tiSay: \"%s\" @ 0x%04X (%u LPC bytes)\n",
+                      tok, dataOff, dataLen);
+      }
+      else
+      {
+        Serial.printf("tiSay: \"%s\" NOT IN VOCAB\n", tok);
+      }
+      tok = strtok(NULL, " ,.");
+    }
+  }
+  if (phraseBytes && phraseLen > 0)
+  {
+    Serial.printf("tiSay: phrase (%d bytes) — synth not wired yet\n",
+                  phraseLen);
+  }
+#else
+  Serial.printf("tiSay: stub (no speech ROM baked) — words=\"%s\" phrase=%d\n",
                 wordStr ? wordStr : "(none)", phraseLen);
-  // TODO stage 2: route to TMS5220 synth + I²S mixer.
   (void)phraseBytes;
+#endif
 }
 
 int tiSpget(const char* word, uint8_t* outBuf, int bufSize)
 {
-  Serial.printf("tiSpget: word=\"%s\" buf=%p cap=%d\n", word, outBuf, bufSize);
-  // TODO stage 2: look up word in spchrom.bin's vocabulary table and
-  // copy its LPC byte sequence into outBuf. For now return zero bytes
-  // so callers see "word not in vocabulary" semantics.
+#if HAVE_SPEECH_ROM
+  uint16_t dataOff = 0;
+  uint8_t  dataLen = 0;
+  if (!speechRomLookup(word, &dataOff, &dataLen))
+  {
+    Serial.printf("tiSpget: \"%s\" not in vocabulary\n", word);
+    return 0;
+  }
+  int n = (dataLen < bufSize) ? dataLen : bufSize;
+  for (int i = 0; i < n; i++)
+  {
+    outBuf[i] = pgm_read_byte(&speechRom[dataOff + i]);
+  }
+  Serial.printf("tiSpget: \"%s\" -> %d bytes from 0x%04X\n",
+                word, n, dataOff);
+  return n;
+#else
+  Serial.printf("tiSpget: stub (no speech ROM baked) — \"%s\"\n", word);
+  (void)outBuf; (void)bufSize;
   return 0;
+#endif
 }
 
 // 60 Hz integration of sprite velocity. Each velocity unit is 1/8 of
