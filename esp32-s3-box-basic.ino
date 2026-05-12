@@ -25,6 +25,7 @@
 #include "audio.h"
 #include <LittleFS.h>
 #include <SD_MMC.h>
+#include <Preferences.h>
 #include "ti_font.h"
 #include "ble_keyboard.h"
 #include "exec_manager.h"
@@ -796,13 +797,11 @@ void tiGetCharPattern(int charCode, uint8_t* out)
 }
 
 // CALL CHARSET: reset characters 32-127 to their ROM default patterns.
-// Leaves user-defined graphics slots (128+) alone.
+// Leaves user-defined graphics slots (128+) alone. Uses whichever font
+// ROM is currently active (PC default or V9T9 TI authentic).
 void tiResetCharset()
 {
-  for (int i = 32; i < 128; i++)
-  {
-    memcpy_P(charPatterns[i], tiFont[i], 8);
-  }
+  resetBasicChars();
   for (int r = 0; r < ROWS; r++)
   {
     for (int c = 0; c < COLS; c++)
@@ -811,6 +810,25 @@ void tiResetCharset()
       if (ch >= 32 && ch < 128) drawCell(c, r);
     }
   }
+}
+
+// CALL CHARSET("PC" | "TI"): switch the active font ROM and persist the
+// choice to NVS so it survives reboot. The interpreter calls this *before*
+// it calls tiResetCharset, so we just update the mode here and let the
+// CHARSET reset do the actual pattern + screen refresh.
+//
+// Mode values: 0 = TI_FONT_PC (PC-style lowercase), 1 = TI_FONT_TI (V9T9
+// authentic TI font with small-caps lowercase).
+void tiSetCharsetMode(int mode)
+{
+  TiFontMode m = (mode == TI_FONT_TI) ? TI_FONT_TI : TI_FONT_PC;
+  if (m == getTiFontMode()) return;   // no-op when unchanged
+  setTiFontMode(m);
+  Preferences prefs;
+  prefs.begin("boxbasic", false);
+  prefs.putUChar("fontmode", (uint8_t)m);
+  prefs.end();
+  Serial.printf("tiSetCharsetMode: now %s\n", m == TI_FONT_TI ? "TI" : "PC");
 }
 
 void tiSetCharColor(int charSet, int fg, int bg)
@@ -3158,6 +3176,14 @@ void setup()
 
   initDisplay();
   initAudio();
+  // Restore font mode from NVS so `CALL CHARSET("TI")` survives reboot.
+  {
+    Preferences prefs;
+    prefs.begin("boxbasic", true);
+    uint8_t saved = prefs.getUChar("fontmode", TI_FONT_PC);
+    prefs.end();
+    setTiFontMode(saved == TI_FONT_TI ? TI_FONT_TI : TI_FONT_PC);
+  }
   initCharPatterns();
   gfxResetColors();
 
