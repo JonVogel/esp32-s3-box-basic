@@ -23,6 +23,7 @@
 #include <LGFX_AUTODETECT.hpp>
 #include <esp_heap_caps.h>
 #include "audio.h"
+#include "tms5220.h"   // triggers arduino-cli discovery of TI_Speech library
 #include <LittleFS.h>
 #include <SD_MMC.h>
 #include <Preferences.h>
@@ -2553,9 +2554,14 @@ static void cmdBle()
 // extract.py). Looks up word names in the cartridge's binary search
 // tree and returns the LPC byte sequence for each phrase.
 //
-// Stage 2b/c (next session): port the TMS5220 LPC-10 synthesizer from
-// MAME and wire its output to the I²S audio mixer. Until then, tiSay
-// resolves words to LPC data and logs what it would speak — no sound.
+// Stage 2b: TMS5220 LPC-10 synth (ported from MAME, BSD-3-Clause —
+// see TI_Speech/tms5220.h) wired into the I²S audio mixer at 8 kHz
+// native, resampled to the 44.1 kHz codec rate. tiSay now actually
+// plays audio: for each vocabulary word it looks up the LPC byte
+// range in PROGMEM, copies into a small stack buffer, and feeds the
+// synth via feedSpeechBytes(); then blocks via isSpeechTalking() so
+// CALL SAY is synchronous from BASIC's perspective (matches real TI
+// behavior where the interpreter waits for speech to finish).
 
 #if HAVE_SPEECH_ROM
 // Walk the vocabulary binary search tree to find a word.
@@ -2608,12 +2614,30 @@ static bool speechRomLookup(const char* word,
 }
 #endif   // HAVE_SPEECH_ROM
 
+// Copy `len` bytes of LPC data out of PROGMEM at `dataOff` into RAM, then
+// hand them to the audio mixer's TMS5220 instance. Splitting the read
+// from the feed lets us pgm_read_byte() one byte at a time without
+// holding the audio mutex across the whole copy.
+static void queueLpcRange(uint16_t dataOff, uint8_t len)
+{
+#if HAVE_SPEECH_ROM
+  if (len == 0) return;
+  uint8_t tmp[256];                          // max single-word LPC size
+  for (uint8_t i = 0; i < len; i++)
+  {
+    tmp[i] = pgm_read_byte(&speechRom[dataOff + i]);
+  }
+  feedSpeechBytes(tmp, len);
+#else
+  (void)dataOff; (void)len;
+#endif
+}
+
 void tiSay(const char* wordStr, const uint8_t* phraseBytes, int phraseLen)
 {
 #if HAVE_SPEECH_ROM
-  // Split wordStr on spaces, commas, periods. For each token, look up
-  // its LPC data offset/length in the vocab tree. Until the synth is
-  // wired (stage 2b), just log what we'd queue.
+  // First, queue every vocabulary word (space/comma/period-delimited).
+  // Unknown words are logged and skipped — on real TI they would beep.
   if (wordStr && *wordStr)
   {
     char buf[128];
@@ -2628,6 +2652,7 @@ void tiSay(const char* wordStr, const uint8_t* phraseBytes, int phraseLen)
       {
         Serial.printf("tiSay: \"%s\" @ 0x%04X (%u LPC bytes)\n",
                       tok, dataOff, dataLen);
+        queueLpcRange(dataOff, dataLen);
       }
       else
       {
@@ -2636,10 +2661,20 @@ void tiSay(const char* wordStr, const uint8_t* phraseBytes, int phraseLen)
       tok = strtok(NULL, " ,.");
     }
   }
+
+  // Then any pre-fetched LPC phrase (typically from a prior CALL SPGET).
+  // Real TI plays words first, then phrase data; we mirror that order.
   if (phraseBytes && phraseLen > 0)
   {
-    Serial.printf("tiSay: phrase (%d bytes) — synth not wired yet\n",
-                  phraseLen);
+    feedSpeechBytes(phraseBytes, (size_t)phraseLen);
+  }
+
+  // Block until the synth drains. Real TI's CALL SAY is synchronous and
+  // BASIC programs rely on that — they CALL SAY then immediately PRINT
+  // assuming the line is silent. Yield to other tasks while we wait.
+  while (isSpeechTalking())
+  {
+    delay(5);
   }
 #else
   Serial.printf("tiSay: stub (no speech ROM baked) — words=\"%s\" phrase=%d\n",

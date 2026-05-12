@@ -24,6 +24,7 @@
 #include <driver/i2s_std.h>
 #include "audio.h"
 #include "TI_Extended_Basic_Interpreter/ti_platform.h"
+#include "tms5220.h"
 
 // ---------------------------------------------------------------------------
 // Box-3 BSP pin constants (per esp-bsp/esp-box-3 + sheet 3 of MB schematic).
@@ -110,6 +111,23 @@ struct Voice
 };
 static Voice g_tone[3];        // voices 1..3
 static Voice g_noise;          // voice 4 (LFSR)
+
+// TMS5220 speech voice — fed from the BASIC CALL SAY / SPGET path, pulled
+// at 8 kHz from inside the mixer at 44100 Hz with a linear-interpolating
+// fractional-phase resampler. The synth state is guarded by g_audio_mux
+// so that feedSpeechBytes() from a non-audio task is safe.
+//
+// Step value: 8000 / 44100 ≈ 0.18141; encoded as 24.8 fixed-point
+// (256 * 8000 / 44100 = 46). The whole-number part is "how many native
+// 8 kHz samples to advance this mixer tick", and the fraction is the
+// crossfade between the previous and current native samples.
+static tms5220::Synth g_speech;
+static const uint32_t SPEECH_STEP_Q8 =
+  (uint32_t)((256ULL * (uint64_t)tms5220::SAMPLE_RATE_HZ) /
+             (uint64_t)SAMPLE_RATE);
+static uint32_t g_speech_phase_q8 = 0;   // fractional phase 0..255
+static int16_t  g_speech_prev = 0;       // previous native 8 kHz sample
+static int16_t  g_speech_curr = 0;       // current  native 8 kHz sample
 
 // LFSR state for noise voice. SN76489: 16-bit, taps at 0 and 3 (→ output bit 0).
 // Initial seed is the standard "single bit" so the first transition is clean.
@@ -334,11 +352,36 @@ static void audioTask(void* /*arg*/)
       // voices, and smooths the noise voice's hard clock edges.
       lpf_y += LPF_ALPHA * (mix - lpf_y);
 
+      // TMS5220 speech voice — runs at 8 kHz native, fractional-phase
+      // resample to our 44.1 kHz mix rate. Linear interpolation
+      // between the previous and current native sample. We pull a new
+      // native sample every time the fractional phase carries past 256.
+      // Routed AFTER the LPF (which is tuned for SN76489 square edges)
+      // because the speech-band content above 3 kHz carries fricative
+      // intelligibility — running it through a 5 kHz LPF muffles "s" /
+      // "sh" / "f" badly.
+      g_speech_phase_q8 += SPEECH_STEP_Q8;
+      while (g_speech_phase_q8 >= 256)
+      {
+        g_speech_phase_q8 -= 256;
+        g_speech_prev = g_speech_curr;
+        g_speech_curr = g_speech.getSample();
+      }
+      float speech_sample =
+        (float)g_speech_prev +
+        ((float)(g_speech_curr - g_speech_prev) *
+         (float)g_speech_phase_q8 * (1.0f / 256.0f));
+
+      // Mix speech in at ~0.6× so a full-volume vocal sits below the
+      // soft-limit's knee alongside an active CALL SOUND chord.
+      float final_mix = lpf_y + speech_sample * 0.6f;
+
       // tanh soft-limit — replaces hard int16 clipping. Real SN76489's
       // analog output stage compressed overshoots gracefully; tanh
       // mimics that, so multi-voice peaks roll off into compression
-      // instead of squaring into harsh distortion.
-      float normalized = lpf_y * (1.0f / 32767.0f);
+      // instead of squaring into harsh distortion. With speech added,
+      // tanh also keeps the loud chirp peaks from clipping mid-vowel.
+      float normalized = final_mix * (1.0f / 32767.0f);
       int16_t s = (int16_t)(tanhf(normalized) * 32767.0f);
 
       buf[i * 2 + 0] = s;
@@ -504,5 +547,39 @@ void tiSoundStop()
   g_tone[0].vol_idx = g_tone[1].vol_idx = g_tone[2].vol_idx = 15;
   g_noise.vol_idx = 15;
   g_sound_end_at = 0;
+  portEXIT_CRITICAL(&g_audio_mux);
+}
+
+// ---------------------------------------------------------------------------
+// Public speech-synth API. The synth runs in the audio task; these
+// functions just push bytes / queries into it under the same critical
+// section the SN76489 voices use. Safe to call from BASIC's main thread.
+// ---------------------------------------------------------------------------
+
+size_t feedSpeechBytes(const uint8_t* bytes, size_t count)
+{
+  if (!g_audio_ready || bytes == nullptr || count == 0) return 0;
+  portENTER_CRITICAL(&g_audio_mux);
+  size_t n = g_speech.writeBytes(bytes, count);
+  portEXIT_CRITICAL(&g_audio_mux);
+  return n;
+}
+
+bool isSpeechTalking()
+{
+  if (!g_audio_ready) return false;
+  portENTER_CRITICAL(&g_audio_mux);
+  bool t = g_speech.isTalking();
+  portEXIT_CRITICAL(&g_audio_mux);
+  return t;
+}
+
+void stopSpeech()
+{
+  if (!g_audio_ready) return;
+  portENTER_CRITICAL(&g_audio_mux);
+  g_speech.reset();
+  g_speech_phase_q8 = 0;
+  g_speech_prev = g_speech_curr = 0;
   portEXIT_CRITICAL(&g_audio_mux);
 }
