@@ -175,8 +175,8 @@ Status legend:
 | CALL JOYST     |  ✅  |  ✅  | BLE gamepad (unit 1); -4/0/+4 per axis     |
 | CALL SOUND     |  ✅  |  ✅  | SN76489-style; 3 tone + 1 noise; PolyBLEP + tanh limit |
 | CALL ERR       |  ✅  |  ✅  | Line is real; severity/code/err-num always 0 (stub) |
-| CALL SAY       |      |      | Speech (TMS5220) — out of scope            |
-| CALL SPGET     |      |      | Speech — out of scope                      |
+| CALL SAY       |  🟡  |      | Speech: parses, calls weak `tiSay` (stage 1 stub). TMS5220 synth + spchrom.bin lookup land in stage 2 |
+| CALL SPGET     |  🟡  |      | Speech vocab fetch: parses, calls weak `tiSpget` (stage 1 stub). Returns 0 bytes until vocab table is wired |
 | CALL INIT      |      |      | Memory Expansion init — no 9900 CPU emulation |
 | CALL LINK      |      |      | Assembly linkage — out of scope            |
 | CALL LOAD      |      |      | Memory poke — out of scope                 |

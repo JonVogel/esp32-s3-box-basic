@@ -2535,6 +2535,29 @@ static void cmdBle()
   BleHidHost::describePeers(printLine);
 }
 
+// CALL SAY / CALL SPGET — speech synth host stubs (stage 1).
+//
+// The interpreter calls these whenever BASIC executes CALL SAY or
+// CALL SPGET. Stage 1 just acknowledges the calls on Serial so we can
+// verify the interpreter wiring without a synth wired up yet. The real
+// TMS5220 + spchrom.bin lookup lands in stage 2.
+void tiSay(const char* wordStr, const uint8_t* phraseBytes, int phraseLen)
+{
+  Serial.printf("tiSay: words=\"%s\" phrase=%d bytes\n",
+                wordStr ? wordStr : "(none)", phraseLen);
+  // TODO stage 2: route to TMS5220 synth + I²S mixer.
+  (void)phraseBytes;
+}
+
+int tiSpget(const char* word, uint8_t* outBuf, int bufSize)
+{
+  Serial.printf("tiSpget: word=\"%s\" buf=%p cap=%d\n", word, outBuf, bufSize);
+  // TODO stage 2: look up word in spchrom.bin's vocabulary table and
+  // copy its LPC byte sequence into outBuf. For now return zero bytes
+  // so callers see "word not in vocabulary" semantics.
+  return 0;
+}
+
 // 60 Hz integration of sprite velocity. Each velocity unit is 1/8 of
 // a TI pixel per frame, so a 16 ms tick advances by vel/8. Sprites
 // that crossed a pixel boundary get erased and redrawn at their new
