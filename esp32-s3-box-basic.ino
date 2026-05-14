@@ -2636,43 +2636,128 @@ static void queueLpcRange(uint16_t dataOff, uint8_t len)
 void tiSay(const char* wordStr, const uint8_t* phraseBytes, int phraseLen)
 {
 #if HAVE_SPEECH_ROM
-  // Two-pass: resolve every word against the vocab first; only commit
-  // to playback if all words are present. If any word fails, say
-  // "UHOH" instead — matches real TI Speech Synthesizer behavior where
-  // a single unknown word aborts the whole utterance.
+  // Greedy longest-match scan over the vocabulary. The TI Speech ROM
+  // contains 12 multi-word entries ("TEXAS INSTRUMENTS", "TRY AGAIN",
+  // "WHAT WAS THAT", etc.), and a naive strtok-on-space would miss
+  // them. Algorithm: tokenize on space, then at each token position
+  // try the longest concatenation that exists in the vocab and
+  // advance past it. If any position fails to match anything, the
+  // whole utterance aborts to "UHOH" (matches real TI behavior).
+  //
+  // Commas are stripped from the input first so "HELLO, WORLD"
+  // tokenises as ["HELLO", "WORLD"]. Periods are kept as-is because
+  // the "." vocab entry should remain reachable as a 1-char lookup.
   if (wordStr && *wordStr)
   {
     char buf[128];
-    strncpy(buf, wordStr, sizeof(buf) - 1);
-    buf[sizeof(buf) - 1] = '\0';
+    int outIdx = 0;
+    for (const char* p = wordStr;
+         *p && outIdx < (int)sizeof(buf) - 1; p++)
+    {
+      if (*p == ',') continue;
+      buf[outIdx++] = *p;
+    }
+    buf[outIdx] = '\0';
+
+    char* tokens[16];
+    int nTokens = 0;
+    char* tk = strtok(buf, " ");
+    while (tk && nTokens < (int)(sizeof(tokens) / sizeof(tokens[0])))
+    {
+      tokens[nTokens++] = tk;
+      tk = strtok(NULL, " ");
+    }
 
     struct WordEntry { uint16_t off; uint8_t len; };
     WordEntry words[16];
     int nWords = 0;
     bool anyMissing = false;
 
-    char* tok = strtok(buf, " ,.");
-    while (tok && nWords < (int)(sizeof(words) / sizeof(words[0])))
+    int pos = 0;
+    while (pos < nTokens &&
+           nWords < (int)(sizeof(words) / sizeof(words[0])))
     {
-      uint16_t dataOff = 0;
-      uint8_t  dataLen = 0;
-      if (speechRomLookup(tok, &dataOff, &dataLen))
+      // Try the longest concatenation tokens[pos..end-1] that's in
+      // the vocab. end starts at nTokens (longest) and shrinks.
+      int bestEnd = -1;
+      uint16_t bestOff = 0;
+      uint8_t  bestLen = 0;
+      char concat[64];
+
+      for (int end = nTokens; end > pos; end--)
       {
-        words[nWords].off = dataOff;
-        words[nWords].len = dataLen;
-        nWords++;
-        Serial.printf("tiSay: \"%s\" @ 0x%04X (%u LPC bytes)\n",
-                      tok, dataOff, dataLen);
+        int p = 0;
+        bool fits = true;
+        for (int i = pos; i < end; i++)
+        {
+          int slen = (int)strlen(tokens[i]);
+          int needed = slen + (i > pos ? 1 : 0);
+          if (p + needed >= (int)sizeof(concat))
+          {
+            fits = false;
+            break;
+          }
+          if (i > pos) concat[p++] = ' ';
+          memcpy(&concat[p], tokens[i], slen);
+          p += slen;
+        }
+        if (!fits) continue;
+        concat[p] = '\0';
+
+        uint16_t off = 0;
+        uint8_t  len = 0;
+        if (speechRomLookup(concat, &off, &len))
+        {
+          bestEnd = end;
+          bestOff = off;
+          bestLen = len;
+          break;   // longest match wins
+        }
       }
-      else
+
+      if (bestEnd < 0)
       {
-        Serial.printf("tiSay: \"%s\" NOT IN VOCAB -> substituting UHOH\n",
-                      tok);
+        Serial.printf("tiSay: \"%s\" NOT IN VOCAB at tok %d -> UHOH\n",
+                      tokens[pos], pos);
         anyMissing = true;
         break;
       }
-      tok = strtok(NULL, " ,.");
+
+      words[nWords].off = bestOff;
+      words[nWords].len = bestLen;
+      nWords++;
+      Serial.printf("tiSay: matched tokens[%d..%d] @ 0x%04X (%u bytes)\n",
+                    pos, bestEnd - 1, bestOff, bestLen);
+      pos = bestEnd;
     }
+
+    // Per-phrase pump: push one phrase, wait for the synth to drain
+    // before pushing the next. The synth drains the FIFO on its STOP
+    // frame, so concatenating multiple phrases into one feedSpeechBytes
+    // call would lose all but the first.
+    //
+    // After the synth reports done, the I²S DMA chain still holds
+    // ~40-50ms of buffered audio that hasn't reached the DAC yet —
+    // including the synth's 23ms energy-ramp fade-out tail. Add a
+    // 150 ms breathing-room delay so the previous word's tail plays
+    // fully before the next word's first sample is generated;
+    // without this, back-to-back CALL SAY calls truncate audibly.
+    auto playPhrase = [](uint16_t off, uint8_t len)
+    {
+      queueLpcRange(off, len);
+      unsigned long deadline = millis() + 5000;
+      while (isSpeechTalking())
+      {
+        if ((long)(millis() - deadline) > 0)
+        {
+          Serial.println("tiSay: per-phrase TIMEOUT — forcing stop");
+          stopSpeech();
+          return;
+        }
+        delay(5);
+      }
+      delay(150);
+    };
 
     if (anyMissing)
     {
@@ -2680,14 +2765,14 @@ void tiSay(const char* wordStr, const uint8_t* phraseBytes, int phraseLen)
       uint8_t  uhLen = 0;
       if (speechRomLookup("UHOH", &uhOff, &uhLen))
       {
-        queueLpcRange(uhOff, uhLen);
+        playPhrase(uhOff, uhLen);
       }
     }
     else
     {
       for (int i = 0; i < nWords; i++)
       {
-        queueLpcRange(words[i].off, words[i].len);
+        playPhrase(words[i].off, words[i].len);
       }
     }
   }

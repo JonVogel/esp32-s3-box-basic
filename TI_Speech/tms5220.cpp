@@ -76,16 +76,32 @@ size_t Synth::writeBytes(const uint8_t* bytes, size_t count)
   }
   m_buffer_empty = (m_fifo_count == 0);
 
-  // Implicit SPEAK-EXTERNAL: when bytes arrive into an idle chip, start
-  // talking. On real hardware this is a separate command; here we have
-  // no command path so we just kick speech on first data arrival.
-  if (!m_SPEN && !m_TALK && !m_TALKD)
+  // Implicit SPEAK-EXTERNAL: ensure the chip will consume the new bytes.
+  // Real hardware has a SPEAK-EXTERNAL command for this; we re-arm SPEN
+  // whenever bytes arrive on an idle-or-shutting-down chip.
+  //
+  // Two cases matter:
+  //   (a) Fully idle (TALK + TALKD + SPEN all false). Reset PC/IP/sub
+  //       so the next frame parse fires cleanly at the next IP=0 PC=12
+  //       sub=1 boundary.
+  //   (b) Shutting down (TALKD still true, ramping energy to zero from
+  //       a previous STOP frame). DON'T reset counters — those are
+  //       advancing through the ramp and resetting would desync the
+  //       interpolation. Just set SPEN so when the chip reaches the
+  //       next frame boundary it parses the new word's first frame.
+  // Without case (b), a back-to-back CALL SAY where the second word's
+  // bytes arrive during the first word's ~26ms shutdown ramp would
+  // leave those bytes orphaned in the FIFO forever (isTalking stuck
+  // true via m_fifo_count > 0).
+  if (!m_SPEN)
   {
     m_SPEN = true;
-    // Force a frame parse on the very next IP=0 PC=12 subcycle=1 boundary.
-    m_PC = 0;
-    m_IP = 0;
-    m_subcycle = 1;
+    if (!m_TALK && !m_TALKD)
+    {
+      m_PC = 0;
+      m_IP = 0;
+      m_subcycle = 1;
+    }
   }
   return written;
 }
@@ -189,12 +205,17 @@ int16_t Synth::clipAnalog(int16_t v) const
 
 int32_t Synth::matrixMultiply(int32_t a, int32_t b) const
 {
-  // Clamp a to 10-bit signed (k coefficient) and b to 14-bit signed
-  // (lattice accumulator). MAME uses `while` loops to wrap; we use min/max.
-  if (a >   511) a -= 1024;
-  if (a <  -512) a += 1024;
-  if (b >  16383) b -= 32768;
-  if (b < -16384) b += 32768;
+  // Wrap a into 10-bit signed (k coefficient range, -512..511) and b
+  // into 14-bit signed (lattice accumulator, -16384..16383). MUST use
+  // while-loops, not single-if conditionals: certain k×x products in
+  // the lattice push values multiple wraps out of range, and a single
+  // wrap leaves them outside the valid window — producing word-specific
+  // garbled audio (the B-word block has K coefficient patterns that
+  // hit this; many other words happen to stay in range).
+  while (a >   511) a -= 1024;
+  while (a <  -512) a += 1024;
+  while (b >  16383) b -= 32768;
+  while (b < -16384) b += 32768;
   return (a * b) >> 9;
 }
 
@@ -252,30 +273,28 @@ int16_t Synth::getSample()
       // m_TALKD stays true while the energy ramps to zero over the next
       // interpolation block — same shutdown ramp the real chip does.
 
-      // The STOP code is only 4 bits; the rest of the current FIFO byte
-      // is padding that the real chip discards. Snap up to the next
-      // byte boundary so isTalking()/m_fifo_count don't lie about
-      // "still has data" when only padding bits remain. Without this,
-      // a one-word CALL SAY hangs forever in the host's wait loop.
-      if (m_fifo_bits_taken != 0)
-      {
-        m_fifo_bits_taken = 0;
-        if (m_fifo_count > 0)
-        {
-          m_fifo[m_fifo_head] = 0;
-          m_fifo_head = (m_fifo_head + 1) % INPUT_FIFO_BYTES;
-          m_fifo_count--;
-        }
-      }
-      m_buffer_empty = (m_fifo_count == 0);
-
-      // If more bytes are still queued (e.g., a multi-word CALL SAY
-      // pushed several phrases back-to-back), re-arm SPEN so the next
-      // frame boundary parses the next phrase's first frame.
-      if (m_fifo_count > 0)
-      {
-        m_SPEN = true;
-      }
+      // STOP frame terminates the current utterance. Drain the entire
+      // FIFO: any bytes still queued belong to this phrase's trailing
+      // padding (TI's encoder pads phrases to byte boundaries and may
+      // leave whole bytes of 0x00 after the STOP code). Those zero
+      // padding bytes would otherwise parse as endless silence frames
+      // since silence is energy_idx=0 and a buffer-empty readBits also
+      // returns zeros — the synth would never reach STOP again and
+      // isTalking() would stay true until the host's timeout fires.
+      //
+      // For back-to-back CALL SAY calls, the host pushes the next
+      // phrase via a new writeBytes() invocation — writeBytes' implicit
+      // SPEAK-EXTERNAL re-arms m_SPEN at that point, so dropping the
+      // FIFO here doesn't lose anything.
+      //
+      // For multi-word CALL SAY within a single utterance: the host
+      // is expected to push one phrase at a time and wait for the
+      // synth to drain between pushes (tiSay's per-word wait loop).
+      m_fifo_head = 0;
+      m_fifo_tail = 0;
+      m_fifo_count = 0;
+      m_fifo_bits_taken = 0;
+      m_buffer_empty = true;
     }
 
     // Interpolation inhibit on voiced<->unvoiced or silence<->unvoiced
