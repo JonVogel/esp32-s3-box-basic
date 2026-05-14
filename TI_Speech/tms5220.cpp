@@ -108,7 +108,13 @@ int Synth::readBits(int count)
       m_buffer_empty = true;
       continue;
     }
-    val = (val << 1) | ((m_fifo[m_fifo_head] >> m_fifo_bits_taken) & 1);
+    // TMS5220 reads LPC bytes MSB-first within each byte (per US patent
+    // 4,331,836 and dumpspch.cpp reference). The original LSB-first read
+    // here meant every nibble in every frame came out bit-reversed,
+    // producing garbled-but-speech-shaped noise instead of intelligible
+    // words.
+    val = (val << 1) |
+          ((m_fifo[m_fifo_head] >> (7 - m_fifo_bits_taken)) & 1);
     m_fifo_bits_taken++;
     if (m_fifo_bits_taken >= 8)
     {
@@ -245,6 +251,31 @@ int16_t Synth::getSample()
       m_TALK = m_SPEN = false;
       // m_TALKD stays true while the energy ramps to zero over the next
       // interpolation block — same shutdown ramp the real chip does.
+
+      // The STOP code is only 4 bits; the rest of the current FIFO byte
+      // is padding that the real chip discards. Snap up to the next
+      // byte boundary so isTalking()/m_fifo_count don't lie about
+      // "still has data" when only padding bits remain. Without this,
+      // a one-word CALL SAY hangs forever in the host's wait loop.
+      if (m_fifo_bits_taken != 0)
+      {
+        m_fifo_bits_taken = 0;
+        if (m_fifo_count > 0)
+        {
+          m_fifo[m_fifo_head] = 0;
+          m_fifo_head = (m_fifo_head + 1) % INPUT_FIFO_BYTES;
+          m_fifo_count--;
+        }
+      }
+      m_buffer_empty = (m_fifo_count == 0);
+
+      // If more bytes are still queued (e.g., a multi-word CALL SAY
+      // pushed several phrases back-to-back), re-arm SPEN so the next
+      // frame boundary parses the next phrase's first frame.
+      if (m_fifo_count > 0)
+      {
+        m_SPEN = true;
+      }
     }
 
     // Interpolation inhibit on voiced<->unvoiced or silence<->unvoiced

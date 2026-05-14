@@ -2636,29 +2636,59 @@ static void queueLpcRange(uint16_t dataOff, uint8_t len)
 void tiSay(const char* wordStr, const uint8_t* phraseBytes, int phraseLen)
 {
 #if HAVE_SPEECH_ROM
-  // First, queue every vocabulary word (space/comma/period-delimited).
-  // Unknown words are logged and skipped — on real TI they would beep.
+  // Two-pass: resolve every word against the vocab first; only commit
+  // to playback if all words are present. If any word fails, say
+  // "UHOH" instead — matches real TI Speech Synthesizer behavior where
+  // a single unknown word aborts the whole utterance.
   if (wordStr && *wordStr)
   {
     char buf[128];
     strncpy(buf, wordStr, sizeof(buf) - 1);
     buf[sizeof(buf) - 1] = '\0';
+
+    struct WordEntry { uint16_t off; uint8_t len; };
+    WordEntry words[16];
+    int nWords = 0;
+    bool anyMissing = false;
+
     char* tok = strtok(buf, " ,.");
-    while (tok)
+    while (tok && nWords < (int)(sizeof(words) / sizeof(words[0])))
     {
       uint16_t dataOff = 0;
       uint8_t  dataLen = 0;
       if (speechRomLookup(tok, &dataOff, &dataLen))
       {
+        words[nWords].off = dataOff;
+        words[nWords].len = dataLen;
+        nWords++;
         Serial.printf("tiSay: \"%s\" @ 0x%04X (%u LPC bytes)\n",
                       tok, dataOff, dataLen);
-        queueLpcRange(dataOff, dataLen);
       }
       else
       {
-        Serial.printf("tiSay: \"%s\" NOT IN VOCAB\n", tok);
+        Serial.printf("tiSay: \"%s\" NOT IN VOCAB -> substituting UHOH\n",
+                      tok);
+        anyMissing = true;
+        break;
       }
       tok = strtok(NULL, " ,.");
+    }
+
+    if (anyMissing)
+    {
+      uint16_t uhOff = 0;
+      uint8_t  uhLen = 0;
+      if (speechRomLookup("UHOH", &uhOff, &uhLen))
+      {
+        queueLpcRange(uhOff, uhLen);
+      }
+    }
+    else
+    {
+      for (int i = 0; i < nWords; i++)
+      {
+        queueLpcRange(words[i].off, words[i].len);
+      }
     }
   }
 
@@ -2672,8 +2702,17 @@ void tiSay(const char* wordStr, const uint8_t* phraseBytes, int phraseLen)
   // Block until the synth drains. Real TI's CALL SAY is synchronous and
   // BASIC programs rely on that — they CALL SAY then immediately PRINT
   // assuming the line is silent. Yield to other tasks while we wait.
+  // Hard timeout of 10 seconds protects against synth state bugs locking
+  // the interpreter forever; real phrases are well under 2 seconds.
+  unsigned long deadline = millis() + 10000;
   while (isSpeechTalking())
   {
+    if ((long)(millis() - deadline) > 0)
+    {
+      Serial.println("tiSay: TIMEOUT — synth never reported done. Forcing stop.");
+      stopSpeech();
+      break;
+    }
     delay(5);
   }
 #else

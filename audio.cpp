@@ -372,9 +372,13 @@ static void audioTask(void* /*arg*/)
         ((float)(g_speech_curr - g_speech_prev) *
          (float)g_speech_phase_q8 * (1.0f / 256.0f));
 
-      // Mix speech in at ~0.6× so a full-volume vocal sits below the
-      // soft-limit's knee alongside an active CALL SOUND chord.
-      float final_mix = lpf_y + speech_sample * 0.6f;
+      // Mix speech in at full gain. The synth's output is already 16-bit
+      // signed (peak ±32767) with natural RMS well below peak for typical
+      // speech, so headroom is fine. When speech overlaps a full CALL
+      // SOUND chord the tanh soft-limit below compresses the sum
+      // gracefully — better than running speech quiet permanently for
+      // the rare overlap case.
+      float final_mix = lpf_y + speech_sample;
 
       // tanh soft-limit — replaces hard int16 clipping. Real SN76489's
       // analog output stage compressed overshoots gracefully; tanh
