@@ -936,6 +936,13 @@ static const uint8_t copyrightBitmap[8] =
 // Pattern approximates the 1981 TI home computer startup screen.
 static void showBootScreen()
 {
+  // While the splash is up, run BLE scan in aggressive TITLE mode so a
+  // keyboard the user just powered on connects within a second or two.
+  // The setup() flow (and the recursive re-show paths below) flip back
+  // to INTERACTIVE after this function returns; nested re-entries
+  // re-arm TITLE on each entry, which is the desired behavior.
+  bleKbSetMode(BLE_KB_TITLE);
+
   // Clear display to cyan in the char area, black outside
   fillBackground(tiPalette[8]);
 
@@ -3341,6 +3348,12 @@ void setup()
 
   // Show TI boot screen and wait for a key
   showBootScreen();
+
+  // User has dismissed the splash; switch BLE keyboard scan from
+  // aggressive TITLE mode to idle INTERACTIVE mode. Radio goes quiet
+  // unless a previously-connected bonded peer drops out, in which case
+  // a single 60-second background-scan window will fire to reconnect.
+  bleKbSetMode(BLE_KB_INTERACTIVE);
 
   // Cursor starts at bottom row (TI behavior)
   cursorRow = ROWS - 1;
