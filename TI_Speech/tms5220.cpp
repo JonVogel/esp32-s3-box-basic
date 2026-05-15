@@ -192,6 +192,14 @@ void Synth::parseFrame()
 
 // Clip the 14-bit lattice output to the analog SPK pin's 10-bit DAC and
 // then upshift back to 16 bits. Faithful to MAME's clip_analog().
+//
+// Real TMS5220 had two output options: this analog SPK pin (8 bits of
+// real dynamic range after the funny clipping logic), or the digital I/O
+// pin (full 12 bits). TI-99/4A cartridges used the analog pin; some
+// arcade boards used digital. The analog clipping is part of the
+// characteristic TMS5220 sound, but it costs ~12 dB of headroom and on
+// modern speakers leaves speech perceptually quiet next to CALL SOUND
+// tones. See digitalOutput() below for the alternative.
 int16_t Synth::clipAnalog(int16_t v) const
 {
   if (v >  2047) v =  2047;
@@ -201,6 +209,22 @@ int16_t Synth::clipAnalog(int16_t v) const
   // upper magnitude bits into the LSBs so silence maps to silence and full
   // scale maps to full scale.
   return (int16_t)((v << 4) | ((v & 0x7F0) >> 3) | ((v & 0x400) >> 10));
+}
+
+// Take the 14-bit lattice output and emit the chip's "digital I/O pin"
+// value: top 12 bits, upshifted to 16-bit with magnitude bits replicated
+// into the low bits. Faithful to MAME's m_digital_select==1 path.
+//   input:  ssss ssss ssss ssss ssnn nnnn nnnn 0000
+//   output: ssss ssss ssss ssss snnn nnnn nnnN NNNN
+//   Where N replicates the upper magnitude bits so 0 → 0 and full → full.
+//
+// vs clipAnalog: ~+12 dB louder on the speaker, no analog-pin clipping.
+// Historically inauthentic for the TI-99/4A (the cartridge used analog),
+// but the Box-3 has no volume knob and we need the headroom.
+int16_t Synth::digitalOutput(int16_t v) const
+{
+  int32_t s = (int32_t)v & ~0xF;
+  return (int16_t)((s << 1) | ((s & 0x3E00) >> 9));
 }
 
 int32_t Synth::matrixMultiply(int32_t a, int32_t b) const
@@ -383,7 +407,11 @@ int16_t Synth::getSample()
   while (s >  16383) s -= 32768;
   while (s < -16384) s += 32768;
 
-  int16_t out = clipAnalog((int16_t)s);
+  // Use the chip's digital-output pin formula (full 12-bit dynamic range)
+  // rather than the analog SPK pin's clipping path. ~+12 dB louder; we
+  // need the headroom on the Box-3's small speaker. To revert for
+  // historical-accuracy purposes, swap to clipAnalog((int16_t)s).
+  int16_t out = digitalOutput((int16_t)s);
 
   // Advance subcycle / PC / IP counters.
   m_subcycle++;

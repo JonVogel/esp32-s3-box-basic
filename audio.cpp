@@ -209,9 +209,15 @@ static bool es8311_init()
   es8311_w(0x1C, 0x6A);
   es8311_w(0x37, 0x08);
 
-  // DAC volume — 0xA0 ≈ -16 dB. Now that the low-pass filter has tamed
-  // the rasp, we can run louder without it getting harsh.
-  es8311_w(0x32, 0xA0);
+  // DAC volume — ES8311 register 0x32 is a linear attenuator: 0xBF = 0 dB
+  // (max), each step down = -0.5 dB. We run at 0xBC ≈ -1.5 dB, leaving a
+  // sliver of headroom below 0 dB. The original -16 dB setting was tuned
+  // conservatively for SN76489 square edges before speech existed; once we
+  // added the TMS5220 voice (lower RMS-to-peak ratio than a square wave)
+  // it sat well below speaker-level. The tanh soft-limit + LPF keep tones
+  // from getting harsh at this level. Will be runtime-settable via
+  // CALL VOLUME() once that BASIC extension lands.
+  es8311_w(0x32, 0xBC);
 
   return true;
 }
@@ -285,9 +291,6 @@ static void audioTask(void* /*arg*/)
   // Stereo I²S frame is 2 × int16_t even if we mix mono.
   int16_t buf[DMA_FRAMES * 2];
   float   lpf_y = 0.0f;     // 1-pole IIR low-pass state
-
-  while (true)
-  {
     // Auto-silence if past the scheduled end time.
     if (millis() >= g_sound_end_at)
     {
@@ -372,13 +375,13 @@ static void audioTask(void* /*arg*/)
         ((float)(g_speech_curr - g_speech_prev) *
          (float)g_speech_phase_q8 * (1.0f / 256.0f));
 
-      // Mix speech in at full gain. The synth's output is already 16-bit
-      // signed (peak ±32767) with natural RMS well below peak for typical
-      // speech, so headroom is fine. When speech overlaps a full CALL
-      // SOUND chord the tanh soft-limit below compresses the sum
-      // gracefully — better than running speech quiet permanently for
-      // the rare overlap case.
-      float final_mix = lpf_y + speech_sample;
+      // Mix speech in at 2.0× (≈ +6 dB above unity). The TMS5220's lattice
+      // output sits mostly in ±8000 even on vowel peaks, so unity gain put
+      // speech well below CALL SOUND tones perceptually. Doubling brings
+      // average vocal level up to where SN76489 voices sit, and the tanh
+      // soft-limit below absorbs the brief excitation-chirp peaks that now
+      // overshoot full scale. Will be runtime-settable via CALL SPVOL().
+      float final_mix = lpf_y + speech_sample * 2.0f;
 
       // tanh soft-limit — replaces hard int16 clipping. Real SN76489's
       // analog output stage compressed overshoots gracefully; tanh

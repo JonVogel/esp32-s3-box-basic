@@ -141,7 +141,8 @@ private:
   void    parseFrame();
   int32_t latticeFilter();
   int32_t matrixMultiply(int32_t a, int32_t b) const;
-  int16_t clipAnalog(int16_t v) const;
+  int16_t clipAnalog(int16_t v) const;     // SPK pin emulation (quieter, period-authentic)
+  int16_t digitalOutput(int16_t v) const;  // digital pin emulation (~+12 dB louder, currently active)
 
   // Helpers for the frame-flag predicates the original used as members.
   bool oldFrameSilence()    const { return m_OLDE; }

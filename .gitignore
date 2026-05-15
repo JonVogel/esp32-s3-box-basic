@@ -1,0 +1,5 @@
+# Local MAME emulator install used as a reference dev tool — not part of
+# the project, not redistributed. Sits at the repo root because that's
+# where it landed; ignored so it doesn't clutter `git status`.
+mame0287b_ti99_win64bit/
+mame0287b_ti99_win64bit.zip
