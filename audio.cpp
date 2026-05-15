@@ -21,6 +21,7 @@
 
 #include <Arduino.h>
 #include <Wire.h>
+#include <Preferences.h>
 #include <driver/i2s_std.h>
 #include "audio.h"
 #include "TI_Extended_Basic_Interpreter/ti_platform.h"
@@ -128,6 +129,25 @@ static const uint32_t SPEECH_STEP_Q8 =
 static uint32_t g_speech_phase_q8 = 0;   // fractional phase 0..255
 static int16_t  g_speech_prev = 0;       // previous native 8 kHz sample
 static int16_t  g_speech_curr = 0;       // current  native 8 kHz sample
+
+// Volume state (CALL VOLUME / CALL SPVOL). Both use SN76489's 0..30 scale
+// internally (0 = loudest, 30 = silent) to match CALL SOUND's vol arg.
+//
+//   g_vol_master: maps linearly to the ES8311 reg 0x32 attenuator at
+//                 -1.5 dB per step. n=0 → 0xBF (0 dB), n=30 → 0x83 (-30 dB).
+//   g_speech_mix: maps to a float mixer multiplier. n=0 → 2.0× (loud),
+//                 n=15 → 1.0× (unity), n=30 → 0.0× (silent).
+//
+// Loaded from NVS at initAudio(); CALL VOLUME / CALL SPVOL update both
+// the live values and the NVS-persisted store. Defaults if no NVS entry:
+// master=0 (loudest, matches the codec setting we hard-coded for boot),
+// speech=0 (loudest, matches the 2.0× mixer we shipped in d2edc7e).
+static volatile int   g_vol_master  = 0;
+static volatile float g_speech_mix  = 2.0f;
+
+// Forward declaration so initAudio() can call this; definition lives
+// alongside the other volume helpers at the end of the file.
+static void loadVolumeFromNvs();
 
 // LFSR state for noise voice. SN76489: 16-bit, taps at 0 and 3 (→ output bit 0).
 // Initial seed is the standard "single bit" so the first transition is clean.
@@ -291,6 +311,9 @@ static void audioTask(void* /*arg*/)
   // Stereo I²S frame is 2 × int16_t even if we mix mono.
   int16_t buf[DMA_FRAMES * 2];
   float   lpf_y = 0.0f;     // 1-pole IIR low-pass state
+
+  while (true)
+  {
     // Auto-silence if past the scheduled end time.
     if (millis() >= g_sound_end_at)
     {
@@ -375,13 +398,13 @@ static void audioTask(void* /*arg*/)
         ((float)(g_speech_curr - g_speech_prev) *
          (float)g_speech_phase_q8 * (1.0f / 256.0f));
 
-      // Mix speech in at 2.0× (≈ +6 dB above unity). The TMS5220's lattice
-      // output sits mostly in ±8000 even on vowel peaks, so unity gain put
-      // speech well below CALL SOUND tones perceptually. Doubling brings
-      // average vocal level up to where SN76489 voices sit, and the tanh
-      // soft-limit below absorbs the brief excitation-chirp peaks that now
-      // overshoot full scale. Will be runtime-settable via CALL SPVOL().
-      float final_mix = lpf_y + speech_sample * 2.0f;
+      // Mix speech in at the runtime-settable speech volume (default 2.0×,
+      // ~+6 dB above unity; the TMS5220's lattice output is mostly in
+      // ±8000 even on vowel peaks). CALL SPVOL() adjusts g_speech_mix
+      // between 0.0× (silent) and 2.0× (loudest). The tanh soft-limit
+      // below absorbs brief excitation-chirp peaks that overshoot full
+      // scale at higher settings.
+      float final_mix = lpf_y + speech_sample * g_speech_mix;
 
       // tanh soft-limit — replaces hard int16 clipping. Real SN76489's
       // analog output stage compressed overshoots gracefully; tanh
@@ -438,6 +461,13 @@ void initAudio()
 
   g_audio_ready = true;
   Serial.println("[audio] PA on, audio task running");
+
+  // Load persisted volume settings from NVS. Has to come AFTER g_audio_ready
+  // since the load applies values through helpers that check that flag.
+  // Boot beep below runs at whatever level NVS specifies — so users who
+  // turned the volume way down get a quiet boot beep on next power-up,
+  // matching expectations.
+  loadVolumeFromNvs();
 
   // Boot beep: 200 ms 800 Hz tone, full volume. If you hear this, the
   // entire audio chain works end-to-end and any silence on CALL SOUND
@@ -589,4 +619,92 @@ void stopSpeech()
   g_speech_phase_q8 = 0;
   g_speech_prev = g_speech_curr = 0;
   portEXIT_CRITICAL(&g_audio_mux);
+}
+
+// ---------------------------------------------------------------------------
+// CALL VOLUME / CALL SPVOL / CALL GETVOLUME / CALL GETSPVOL.
+// All four use the SN76489 0..30 scale: 0 = loudest, 30 = silent.
+// Strong overrides of the interpreter's weak tiSetVolume / etc.
+// Persisted to NVS so the setting survives reboots — important on
+// hardware without a physical volume knob.
+// ---------------------------------------------------------------------------
+
+// 0..30 → ES8311 reg 0x32 value. -1.5 dB per step (3 register steps =
+// 1 input step, since each register step is 0.5 dB). Clamped to [0x83,0xBF]
+// so n=30 sits at -30 dB rather than driving the register all the way to
+// silent (0xBF - 30*3 = 0x83 = -30 dB, plenty for "minimum").
+static uint8_t masterRegFromN(int n)
+{
+  if (n < 0)  n = 0;
+  if (n > 30) n = 30;
+  return (uint8_t)(0xBF - (n * 3));
+}
+
+void tiSetVolume(int n)
+{
+  if (!g_audio_ready) return;
+  if (n < 0)  n = 0;
+  if (n > 30) n = 30;
+  g_vol_master = n;
+  es8311_w(0x32, masterRegFromN(n));
+  Preferences prefs;
+  prefs.begin("boxbasic", false);
+  prefs.putUChar("volMaster", (uint8_t)n);
+  prefs.end();
+}
+
+void tiGetVolume(int* out)
+{
+  if (out) *out = g_vol_master;
+}
+
+void tiSetSpeechVolume(int n)
+{
+  if (n < 0)  n = 0;
+  if (n > 30) n = 30;
+  // Linear 0..30 → 2.0..0.0× mixer multiplier. Half-scale (n=15) lands
+  // at the unity 1.0× point so users have a clear "default" feel.
+  float gain = 2.0f * (1.0f - (float)n / 30.0f);
+  portENTER_CRITICAL(&g_audio_mux);
+  g_speech_mix = gain;
+  portEXIT_CRITICAL(&g_audio_mux);
+  Preferences prefs;
+  prefs.begin("boxbasic", false);
+  prefs.putUChar("volSpeech", (uint8_t)n);
+  prefs.end();
+}
+
+void tiGetSpeechVolume(int* out)
+{
+  if (!out) return;
+  // Reverse the linear map. Round to nearest integer for cleanliness.
+  float g = g_speech_mix;
+  int n = (int)(30.0f * (1.0f - g / 2.0f) + 0.5f);
+  if (n < 0)  n = 0;
+  if (n > 30) n = 30;
+  *out = n;
+}
+
+// Called once from initAudio() to load NVS-persisted volume settings.
+// Applies them via the same Set functions so codec/mixer state stays
+// in sync with the live g_vol_* values. No-op if no NVS entry exists
+// (defaults shipped in the globals stand).
+static void loadVolumeFromNvs()
+{
+  Preferences prefs;
+  prefs.begin("boxbasic", true);  // read-only
+  bool hasMaster = prefs.isKey("volMaster");
+  bool hasSpeech = prefs.isKey("volSpeech");
+  uint8_t master = hasMaster ? prefs.getUChar("volMaster", 0) : 0;
+  uint8_t speech = hasSpeech ? prefs.getUChar("volSpeech", 0) : 0;
+  prefs.end();
+  if (hasMaster)
+  {
+    g_vol_master = master;
+    es8311_w(0x32, masterRegFromN(master));
+  }
+  if (hasSpeech)
+  {
+    g_speech_mix = 2.0f * (1.0f - (float)speech / 30.0f);
+  }
 }
