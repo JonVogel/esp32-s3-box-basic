@@ -4,9 +4,11 @@ Build-time bake of the TI-99/4A Speech Synthesizer cartridge ROM (`spchrom.bin`)
 
 ## Why this exists
 
-`spchrom.bin` is copyrighted TI material. We don't redistribute it. The user supplies their own copy (e.g., from a MESS BIOS bundle), runs `extract.py`, and gets `speech_rom.h` written here. The `.ino` includes that header when it's present and falls back to stubs when it isn't — so a fresh clone still builds, it just doesn't have real speech.
+`speech_rom.h` is the cartridge ROM baked into a `PROGMEM` C array so the firmware can do real vocabulary lookups without runtime file I/O. It ships in the repo so a fresh clone builds with working speech.
 
-## Generate
+If you want to swap in a different dump (Speech Editor extended vocab, Geneve speech ROM, etc.), run `extract.py` to overwrite `speech_rom.h` from your own binary.
+
+## Regenerate
 
 ```sh
 python extract.py path/to/spchrom.bin
@@ -33,6 +35,6 @@ The tree contains roughly 373 vocabulary words (digits, letters, color names, nu
 
 | File | Purpose |
 |---|---|
-| `extract.py` | Reads a user `spchrom.bin`, writes `speech_rom.h` |
-| `speech_rom.h` | Generated. Not committed — see `.gitignore` |
+| `extract.py` | Reads a `spchrom.bin` dump and writes `speech_rom.h` |
+| `speech_rom.h` | Baked cartridge ROM (PROGMEM C array). Committed. |
 | `README.md` | This file |

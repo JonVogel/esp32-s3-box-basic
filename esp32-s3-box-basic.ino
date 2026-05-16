@@ -23,6 +23,7 @@
 #include <LGFX_AUTODETECT.hpp>
 #include <esp_heap_caps.h>
 #include "audio.h"
+#include "tms5220.h"   // triggers arduino-cli discovery of TI_Speech library
 #include <LittleFS.h>
 #include <SD_MMC.h>
 #include <Preferences.h>
@@ -2560,9 +2561,14 @@ static void cmdBle()
 // extract.py). Looks up word names in the cartridge's binary search
 // tree and returns the LPC byte sequence for each phrase.
 //
-// Stage 2b/c (next session): port the TMS5220 LPC-10 synthesizer from
-// MAME and wire its output to the I²S audio mixer. Until then, tiSay
-// resolves words to LPC data and logs what it would speak — no sound.
+// Stage 2b: TMS5220 LPC-10 synth (ported from MAME, BSD-3-Clause —
+// see TI_Speech/tms5220.h) wired into the I²S audio mixer at 8 kHz
+// native, resampled to the 44.1 kHz codec rate. tiSay now actually
+// plays audio: for each vocabulary word it looks up the LPC byte
+// range in PROGMEM, copies into a small stack buffer, and feeds the
+// synth via feedSpeechBytes(); then blocks via isSpeechTalking() so
+// CALL SAY is synchronous from BASIC's perspective (matches real TI
+// behavior where the interpreter waits for speech to finish).
 
 #if HAVE_SPEECH_ROM
 // Walk the vocabulary binary search tree to find a word.
@@ -2615,38 +2621,191 @@ static bool speechRomLookup(const char* word,
 }
 #endif   // HAVE_SPEECH_ROM
 
+// Copy `len` bytes of LPC data out of PROGMEM at `dataOff` into RAM, then
+// hand them to the audio mixer's TMS5220 instance. Splitting the read
+// from the feed lets us pgm_read_byte() one byte at a time without
+// holding the audio mutex across the whole copy.
+static void queueLpcRange(uint16_t dataOff, uint8_t len)
+{
+#if HAVE_SPEECH_ROM
+  if (len == 0) return;
+  uint8_t tmp[256];                          // max single-word LPC size
+  for (uint8_t i = 0; i < len; i++)
+  {
+    tmp[i] = pgm_read_byte(&speechRom[dataOff + i]);
+  }
+  feedSpeechBytes(tmp, len);
+#else
+  (void)dataOff; (void)len;
+#endif
+}
+
 void tiSay(const char* wordStr, const uint8_t* phraseBytes, int phraseLen)
 {
 #if HAVE_SPEECH_ROM
-  // Split wordStr on spaces, commas, periods. For each token, look up
-  // its LPC data offset/length in the vocab tree. Until the synth is
-  // wired (stage 2b), just log what we'd queue.
+  // Greedy longest-match scan over the vocabulary. The TI Speech ROM
+  // contains 12 multi-word entries ("TEXAS INSTRUMENTS", "TRY AGAIN",
+  // "WHAT WAS THAT", etc.), and a naive strtok-on-space would miss
+  // them. Algorithm: tokenize on space, then at each token position
+  // try the longest concatenation that exists in the vocab and
+  // advance past it. If any position fails to match anything, the
+  // whole utterance aborts to "UHOH" (matches real TI behavior).
+  //
+  // Commas are stripped from the input first so "HELLO, WORLD"
+  // tokenises as ["HELLO", "WORLD"]. Periods are kept as-is because
+  // the "." vocab entry should remain reachable as a 1-char lookup.
   if (wordStr && *wordStr)
   {
     char buf[128];
-    strncpy(buf, wordStr, sizeof(buf) - 1);
-    buf[sizeof(buf) - 1] = '\0';
-    char* tok = strtok(buf, " ,.");
-    while (tok)
+    int outIdx = 0;
+    for (const char* p = wordStr;
+         *p && outIdx < (int)sizeof(buf) - 1; p++)
     {
-      uint16_t dataOff = 0;
-      uint8_t  dataLen = 0;
-      if (speechRomLookup(tok, &dataOff, &dataLen))
+      if (*p == ',') continue;
+      buf[outIdx++] = *p;
+    }
+    buf[outIdx] = '\0';
+
+    char* tokens[16];
+    int nTokens = 0;
+    char* tk = strtok(buf, " ");
+    while (tk && nTokens < (int)(sizeof(tokens) / sizeof(tokens[0])))
+    {
+      tokens[nTokens++] = tk;
+      tk = strtok(NULL, " ");
+    }
+
+    struct WordEntry { uint16_t off; uint8_t len; };
+    WordEntry words[16];
+    int nWords = 0;
+    bool anyMissing = false;
+
+    int pos = 0;
+    while (pos < nTokens &&
+           nWords < (int)(sizeof(words) / sizeof(words[0])))
+    {
+      // Try the longest concatenation tokens[pos..end-1] that's in
+      // the vocab. end starts at nTokens (longest) and shrinks.
+      int bestEnd = -1;
+      uint16_t bestOff = 0;
+      uint8_t  bestLen = 0;
+      char concat[64];
+
+      for (int end = nTokens; end > pos; end--)
       {
-        Serial.printf("tiSay: \"%s\" @ 0x%04X (%u LPC bytes)\n",
-                      tok, dataOff, dataLen);
+        int p = 0;
+        bool fits = true;
+        for (int i = pos; i < end; i++)
+        {
+          int slen = (int)strlen(tokens[i]);
+          int needed = slen + (i > pos ? 1 : 0);
+          if (p + needed >= (int)sizeof(concat))
+          {
+            fits = false;
+            break;
+          }
+          if (i > pos) concat[p++] = ' ';
+          memcpy(&concat[p], tokens[i], slen);
+          p += slen;
+        }
+        if (!fits) continue;
+        concat[p] = '\0';
+
+        uint16_t off = 0;
+        uint8_t  len = 0;
+        if (speechRomLookup(concat, &off, &len))
+        {
+          bestEnd = end;
+          bestOff = off;
+          bestLen = len;
+          break;   // longest match wins
+        }
       }
-      else
+
+      if (bestEnd < 0)
       {
-        Serial.printf("tiSay: \"%s\" NOT IN VOCAB\n", tok);
+        Serial.printf("tiSay: \"%s\" NOT IN VOCAB at tok %d -> UHOH\n",
+                      tokens[pos], pos);
+        anyMissing = true;
+        break;
       }
-      tok = strtok(NULL, " ,.");
+
+      words[nWords].off = bestOff;
+      words[nWords].len = bestLen;
+      nWords++;
+      Serial.printf("tiSay: matched tokens[%d..%d] @ 0x%04X (%u bytes)\n",
+                    pos, bestEnd - 1, bestOff, bestLen);
+      pos = bestEnd;
+    }
+
+    // Per-phrase pump: push one phrase, wait for the synth to drain
+    // before pushing the next. The synth drains the FIFO on its STOP
+    // frame, so concatenating multiple phrases into one feedSpeechBytes
+    // call would lose all but the first.
+    //
+    // After the synth reports done, the I²S DMA chain still holds
+    // ~40-50ms of buffered audio that hasn't reached the DAC yet —
+    // including the synth's 23ms energy-ramp fade-out tail. Add a
+    // 150 ms breathing-room delay so the previous word's tail plays
+    // fully before the next word's first sample is generated;
+    // without this, back-to-back CALL SAY calls truncate audibly.
+    auto playPhrase = [](uint16_t off, uint8_t len)
+    {
+      queueLpcRange(off, len);
+      unsigned long deadline = millis() + 5000;
+      while (isSpeechTalking())
+      {
+        if ((long)(millis() - deadline) > 0)
+        {
+          Serial.println("tiSay: per-phrase TIMEOUT — forcing stop");
+          stopSpeech();
+          return;
+        }
+        delay(5);
+      }
+      delay(150);
+    };
+
+    if (anyMissing)
+    {
+      uint16_t uhOff = 0;
+      uint8_t  uhLen = 0;
+      if (speechRomLookup("UHOH", &uhOff, &uhLen))
+      {
+        playPhrase(uhOff, uhLen);
+      }
+    }
+    else
+    {
+      for (int i = 0; i < nWords; i++)
+      {
+        playPhrase(words[i].off, words[i].len);
+      }
     }
   }
+
+  // Then any pre-fetched LPC phrase (typically from a prior CALL SPGET).
+  // Real TI plays words first, then phrase data; we mirror that order.
   if (phraseBytes && phraseLen > 0)
   {
-    Serial.printf("tiSay: phrase (%d bytes) — synth not wired yet\n",
-                  phraseLen);
+    feedSpeechBytes(phraseBytes, (size_t)phraseLen);
+  }
+
+  // Block until the synth drains. Real TI's CALL SAY is synchronous and
+  // BASIC programs rely on that — they CALL SAY then immediately PRINT
+  // assuming the line is silent. Yield to other tasks while we wait.
+  // Hard timeout of 10 seconds protects against synth state bugs locking
+  // the interpreter forever; real phrases are well under 2 seconds.
+  unsigned long deadline = millis() + 10000;
+  while (isSpeechTalking())
+  {
+    if ((long)(millis() - deadline) > 0)
+    {
+      Serial.println("tiSay: TIMEOUT — synth never reported done. Forcing stop.");
+      stopSpeech();
+      break;
+    }
+    delay(5);
   }
 #else
   Serial.printf("tiSay: stub (no speech ROM baked) — words=\"%s\" phrase=%d\n",
