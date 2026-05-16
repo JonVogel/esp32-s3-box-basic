@@ -44,6 +44,7 @@
 #include "file_io.h"
 #include "sprites.h"
 #include "line_editor.h"
+#include "web_files.h"
 
 // LCD pins (ESP32-S3-Box-3, per esp-bsp/esp-box-3)
 #define LCD_DC    4
@@ -2547,6 +2548,28 @@ void tiUnpair()
   BleHidHost::requestUnpairAll();
 }
 
+// Strong overrides for CALL WIFI — route to the web_files manager.
+void tiWifiSet(const char* ssid, const char* pass)
+{
+  webfiles::setCredentials(ssid, pass);
+}
+void tiWifiForget()
+{
+  webfiles::forget();
+}
+void tiWifiStatus(char* out, int outSize)
+{
+  webfiles::status(out, outSize);
+}
+void tiWifiOff()
+{
+  webfiles::radioOff();
+}
+void tiWifiOn()
+{
+  webfiles::radioOn();
+}
+
 // `BLE` shell command — prints the bonded-peer table to the BASIC console
 // for diagnosing pairing / reconnect issues from inside BASIC.
 static void cmdBle()
@@ -3505,6 +3528,14 @@ void setup()
   // (F12 or BOOT button = pairing mode.)
   bleKbInit();
 
+  // WiFi + web file manager. Reads NVS for credentials and starts WiFi
+  // in STA mode. Non-blocking — the connect happens in the background
+  // while the title screen and interpreter come up. BLE-first ordering
+  // (above) gives BLE the cleaner coexistence slot per Espressif's
+  // RF coexistence guide. With no creds in NVS, this is a no-op until
+  // the user types CALL WIFI("ssid","pass") at the prompt.
+  webfiles::begin();
+
   // Show TI boot screen and wait for a key
   showBootScreen();
 
@@ -3563,6 +3594,7 @@ void loop()
 {
   pasteDrainSerial();
   bleKbTask();
+  webfiles::tick();
   checkInput();
   spriteTick();
 
