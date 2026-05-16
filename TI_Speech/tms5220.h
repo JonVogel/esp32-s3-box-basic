@@ -57,6 +57,18 @@
 #include <stdint.h>
 #include <stddef.h>
 
+// Debug instrumentation. When defined non-zero, parseFrame() prints a
+// single Serial.printf line per parsed frame showing energy / repeat /
+// pitch / k1..k10 indices. Use to diagnose audible garble on specific
+// words: flash with this enabled, run CALL SAY("WORD"), inspect the
+// frame stream. Adds ~150 bytes per call and small CPU overhead, so
+// keep at 0 for normal builds. The print routes through Arduino's
+// Serial, which is initialized by the host's setup() — we don't bring
+// it up here.
+#ifndef TMS5220_DEBUG
+#define TMS5220_DEBUG 0
+#endif
+
 namespace tms5220
 {
 

@@ -18,6 +18,10 @@
 #include "tms5220.h"
 #include "tms5220_coeffs.h"
 
+#if TMS5220_DEBUG
+#include <Arduino.h>
+#endif
+
 namespace tms5220
 {
 
@@ -156,6 +160,13 @@ int Synth::readBits(int count)
 void Synth::parseFrame()
 {
   m_uv_zpar = m_zpar = false;
+#if TMS5220_DEBUG
+  // Snapshot the FIFO byte offset and bit position at the start of this
+  // parse so the log line can show "where in the stream we are."
+  uint16_t dbg_start_head = m_fifo_head;
+  uint8_t  dbg_start_bits = m_fifo_bits_taken;
+  const char* dbg_exit_reason = "full";
+#endif
 
   // Energy
   m_new_frame_energy_idx = (uint8_t)readBits(ENERGY_BITS);
@@ -163,6 +174,12 @@ void Synth::parseFrame()
   {
     // Silence (0) or stop (15) — process() handles these via the
     // newFrameStop()/newFrameSilence() predicates. No more bits to read.
+#if TMS5220_DEBUG
+    Serial.printf("[5220] @h=%u/b=%u  E=%u  %s\n",
+                  dbg_start_head, dbg_start_bits,
+                  m_new_frame_energy_idx,
+                  m_new_frame_energy_idx == 0 ? "silence" : "STOP");
+#endif
     return;
   }
 
@@ -174,7 +191,16 @@ void Synth::parseFrame()
   m_new_frame_pitch_idx = (uint8_t)readBits(PITCH_BITS);
   m_uv_zpar = newFrameUnvoiced();
 
-  if (rep) return;   // keep prior k coefficients
+  if (rep)
+  {
+#if TMS5220_DEBUG
+    Serial.printf("[5220] @h=%u/b=%u  E=%u  R=1  P=%u  (repeat-reuse-K)\n",
+                  dbg_start_head, dbg_start_bits,
+                  m_new_frame_energy_idx,
+                  m_new_frame_pitch_idx);
+#endif
+    return;   // keep prior k coefficients
+  }
 
   for (int i = 0; i < 4; i++)
   {
@@ -182,12 +208,34 @@ void Synth::parseFrame()
   }
 
   // Unvoiced frames stop here — k5..k10 are forced to zero in the generator.
-  if (m_new_frame_pitch_idx == 0) return;
+  if (m_new_frame_pitch_idx == 0)
+  {
+#if TMS5220_DEBUG
+    dbg_exit_reason = "unvoiced-k1-4";
+    Serial.printf("[5220] @h=%u/b=%u  E=%u  R=0  P=0  K=[%u,%u,%u,%u]  %s\n",
+                  dbg_start_head, dbg_start_bits,
+                  m_new_frame_energy_idx,
+                  m_new_frame_k_idx[0], m_new_frame_k_idx[1],
+                  m_new_frame_k_idx[2], m_new_frame_k_idx[3],
+                  dbg_exit_reason);
+#endif
+    return;
+  }
 
   for (int i = 4; i < NUM_K; i++)
   {
     m_new_frame_k_idx[i] = (uint8_t)readBits(KBITS[i]);
   }
+#if TMS5220_DEBUG
+  Serial.printf("[5220] @h=%u/b=%u  E=%u  R=0  P=%u  K=[%u,%u,%u,%u,%u,%u,%u,%u,%u,%u]\n",
+                dbg_start_head, dbg_start_bits,
+                m_new_frame_energy_idx, m_new_frame_pitch_idx,
+                m_new_frame_k_idx[0], m_new_frame_k_idx[1],
+                m_new_frame_k_idx[2], m_new_frame_k_idx[3],
+                m_new_frame_k_idx[4], m_new_frame_k_idx[5],
+                m_new_frame_k_idx[6], m_new_frame_k_idx[7],
+                m_new_frame_k_idx[8], m_new_frame_k_idx[9]);
+#endif
 }
 
 // Clip the 14-bit lattice output to the analog SPK pin's 10-bit DAC and
