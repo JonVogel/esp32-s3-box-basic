@@ -16,6 +16,9 @@
 #include <WiFi.h>
 #include <Preferences.h>
 #include <ESPAsyncWebServer.h>
+#include <LittleFS.h>
+#include <SD_MMC.h>
+#include "ESP32_File_Handling/file_io.h"
 
 namespace webfiles
 {
@@ -65,12 +68,180 @@ namespace webfiles
       req->send(200, "application/json", body);
     });
 
-    // Catch-all so a bare browser hit doesn't 404 confusingly while
-    // we don't have a real UI yet. Real / handler lands in step 2.
+    // /api/files?dev=FLASH | SDCARD | DSK1..DSK9 / DSKA..DSKZ
+    // Returns JSON: {"device":"FLASH","files":[{"name":"X","size":N},...]}
+    // or {"device":"...","error":"..."} on a problem. The front-end
+    // populates a table per device; this is the only file-listing path.
+    s_server.on("/api/files", HTTP_GET, [](AsyncWebServerRequest* req) {
+      String dev = req->hasParam("dev") ? req->getParam("dev")->value() : "FLASH";
+      // Use a chunked-response so we don't have to size a buffer ahead.
+      // The JSON we emit is small even on a full SD card (a few KB) so
+      // a String-based response would also work, but the chunked form
+      // avoids allocating the whole payload at once.
+      AsyncWebServerResponse* resp = nullptr;
+
+      // Enumerate into a String we then ship. Bounded by FIFO size of
+      // the underlying device; in practice <2 KB even for SD with
+      // hundreds of files. If this proves too memory-hungry we can
+      // refactor to true streaming later.
+      String body;
+      body.reserve(2048);
+      body += "{\"device\":\"";
+      body += dev;
+      body += "\",\"files\":[";
+      bool first = true;
+      auto appendFile = [&](const char* name, long size) {
+        if (!first) body += ',';
+        first = false;
+        body += "{\"name\":\"";
+        // Bare minimum escaping for JSON. File systems shouldn't normally
+        // produce names with quotes or backslashes but be defensive.
+        for (const char* p = name; *p; ++p)
+        {
+          if (*p == '"' || *p == '\\') body += '\\';
+          body += *p;
+        }
+        body += "\",\"size\":";
+        body += String(size);
+        body += '}';
+      };
+
+      bool ok = true;
+      String error;
+
+      if (dev.equalsIgnoreCase("FLASH"))
+      {
+        File root = LittleFS.open("/");
+        File f = root.openNextFile();
+        while (f)
+        {
+          const char* n = f.name();
+          bool hide = f.isDirectory() || n[0] == '.';
+          if (!hide) appendFile(n, (long)f.size());
+          f = root.openNextFile();
+        }
+      }
+      else if (dev.equalsIgnoreCase("SDCARD") || dev.equalsIgnoreCase("SD"))
+      {
+        if (!fio::g_sdOk) { ok = false; error = "SD not present"; }
+        else
+        {
+          File root = SD_MMC.open("/");
+          File f = root.openNextFile();
+          while (f)
+          {
+            const char* n = f.name();
+            bool hide = f.isDirectory() || n[0] == '.' ||
+                        strcasecmp(n, "System Volume Information") == 0;
+            if (!hide) appendFile(n, (long)f.size());
+            f = root.openNextFile();
+          }
+        }
+      }
+      else if (dev.length() >= 4 &&
+               (dev[0] == 'd' || dev[0] == 'D') &&
+               (dev[1] == 's' || dev[1] == 'S') &&
+               (dev[2] == 'k' || dev[2] == 'K'))
+      {
+        int drive = fio::driveFromChar(dev[3]);
+        dsk::DskImage* img = (drive > 0) ? fio::dskImage(drive) : nullptr;
+        if (!img) { ok = false; error = "not mounted"; }
+        else
+        {
+          dsk::DskImage::CatEntry ents[64];
+          int n = img->listCatalog(ents, 64);
+          for (int i = 0; i < n; i++)
+          {
+            // DSK catalog stores filenames as 10-char fixed; trim trailing
+            // spaces for nicer JSON. Size is sector count (256 B each).
+            char nm[12];
+            strncpy(nm, ents[i].name, 10);
+            nm[10] = '\0';
+            for (int j = 9; j >= 0 && nm[j] == ' '; j--) nm[j] = '\0';
+            appendFile(nm, (long)ents[i].totalSectors * 256L);
+          }
+        }
+      }
+      else
+      {
+        ok = false;
+        error = "unknown device";
+      }
+
+      if (!ok)
+      {
+        body = "{\"device\":\"";
+        body += dev;
+        body += "\",\"error\":\"";
+        body += error;
+        body += "\"}";
+      }
+      else
+      {
+        body += "]}";
+      }
+      req->send(200, "application/json", body);
+    });
+
+    // Root HTML page. Plain, server-rendered shell that uses fetch() to
+    // populate the file table from /api/files. No JS framework, no
+    // external CDN — the whole UI is self-contained and works without
+    // internet access from the browser (only LAN access to the device).
+    s_server.on("/", HTTP_GET, [](AsyncWebServerRequest* req) {
+      // Listing all common devices up front so the dropdown is populated
+      // statically. The user changes the device and the JS refetches.
+      // Kept short and inline so the entire UI lives in this one file.
+      static const char PAGE[] PROGMEM =
+        "<!doctype html><html><head><meta charset=utf-8>"
+        "<title>TI Extended BASIC Files</title>"
+        "<style>"
+        "body{font-family:monospace;background:#001;color:#cdf;margin:1em;}"
+        "h1{color:#fff;border-bottom:1px solid #468;padding-bottom:.3em;}"
+        "select,button{font-family:monospace;background:#024;color:#cdf;"
+        "border:1px solid #468;padding:.3em .6em;}"
+        "table{margin-top:1em;border-collapse:collapse;}"
+        "th,td{padding:.2em .8em;text-align:left;border-bottom:1px solid #246;}"
+        "th{color:#fff;}"
+        "tr:hover{background:#012;}"
+        ".err{color:#f88;}"
+        ".muted{color:#789;font-size:.9em;}"
+        "</style></head><body>"
+        "<h1>TI Extended BASIC &mdash; File Browser</h1>"
+        "<label>Device: <select id=dev>"
+        "<option>FLASH</option><option>SDCARD</option>"
+        "<option>DSK1</option><option>DSK2</option><option>DSK3</option>"
+        "</select></label> "
+        "<button onclick=refresh()>Refresh</button>"
+        "<span class=muted id=status></span>"
+        "<table id=ftbl><thead><tr><th>Name</th><th>Size</th></tr>"
+        "</thead><tbody></tbody></table>"
+        "<script>"
+        "async function refresh(){"
+        "const d=document.getElementById('dev').value;"
+        "const s=document.getElementById('status');"
+        "const tb=document.querySelector('#ftbl tbody');"
+        "tb.innerHTML='';s.textContent='loading...';"
+        "try{"
+        "const r=await fetch('/api/files?dev='+encodeURIComponent(d));"
+        "const j=await r.json();"
+        "if(j.error){s.innerHTML='<span class=err>'+j.error+'</span>';return;}"
+        "s.textContent=j.files.length+' file(s)';"
+        "for(const f of j.files){"
+        "const tr=document.createElement('tr');"
+        "tr.innerHTML='<td>'+f.name+'</td><td>'+f.size+'</td>';"
+        "tb.appendChild(tr);"
+        "}}catch(e){s.innerHTML='<span class=err>'+e+'</span>';}}"
+        "document.getElementById('dev').onchange=refresh;"
+        "refresh();"
+        "</script></body></html>";
+      req->send_P(200, "text/html", PAGE);
+    });
+
+    // 404 for anything else. Endpoints handled above: GET /, /api/status,
+    // /api/files. Future endpoints (upload, download, delete) hang off
+    // /api/files/... so they shadow this.
     s_server.onNotFound([](AsyncWebServerRequest* req) {
-      req->send(200, "text/plain",
-                "TI Extended BASIC web file manager\n"
-                "Endpoints so far: /api/status\n");
+      req->send(404, "text/plain", "not found\n");
     });
 
     s_server.begin();
