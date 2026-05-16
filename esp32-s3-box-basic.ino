@@ -1019,6 +1019,7 @@ static void showBootScreen()
     while (!Serial.available() && !bleKbAvailable())
     {
       bleKbTask();
+      webfiles::tick();
       bool nowPair = BleHidHost::userInitiatedPairing();
       if (nowPair != prevPair)
       {
@@ -1096,6 +1097,7 @@ static void showBootScreen()
     while (!Serial.available() && !bleKbAvailable())
     {
       bleKbTask();
+      webfiles::tick();
       bool nowPair = BleHidHost::userInitiatedPairing();
       if (nowPair != prevPair)
       {
@@ -1712,6 +1714,7 @@ static bool getInputLine(char* buf, int bufSize)
     }
 
     bleKbTask();
+    webfiles::tick();
 
     int c;
     while ((c = editorReadChar()) >= 0)
@@ -1981,6 +1984,7 @@ static void catPrintLine(const char* s)
     while (c < 0)
     {
       bleKbTask();
+      webfiles::tick();
       yield();
       c = editorReadChar();
     }
@@ -3113,6 +3117,7 @@ static void cmdNewDisk(const char* spec, const char* volName,
     {
       c = editorReadChar();
       bleKbTask();
+      webfiles::tick();
       yield();
     } while (c < 0);
     if (c != 'Y' && c != 'y')
