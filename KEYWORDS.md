@@ -37,7 +37,7 @@ Status legend:
 | CAT / CATALOG  |  ✅  |  ✅  | Alias for DIR                                    |
 | MOUNT          |  ✅  |  ✅  | Bare = list mounts; `MOUNT DSK<n> <image>` to attach |
 | UNMOUNT        |  ✅  |  ✅  | `UNMOUNT DSK<n>`                                 |
-| NEWDISK        |  ✅  |  ✅  | Create blank V9T9 .DSK on FLASH or SDCARD, SSSD/DSSD/DSDD |
+| NEWDISK        |  ✅  |  ✅  | `NEWDISK <device.name> ["VOLNAME"] [SSSD\|DSSD\|DSDD]` — create a blank V9T9 .DSK image. Spec like `FLASH.WORK.DSK` or `SDCARD.GAMES.DSK`. VOLNAME quoted, 1-10 chars, defaults to `NEWDISK`. Size defaults to SSSD (360 sec / 90 KB); DSSD = 720 / 180 KB; DSDD = 1440 / 360 KB. Separators can be spaces or commas |
 | COPY           |  ✅  |  ✅  | `COPY <src> <dst>` across FLASH / SDCARD / DSK<n> |
 
 ## Program control flow
@@ -175,8 +175,8 @@ Status legend:
 | CALL JOYST     |  ✅  |  ✅  | BLE gamepad (unit 1); -4/0/+4 per axis     |
 | CALL SOUND     |  ✅  |  ✅  | SN76489-style; 3 tone + 1 noise; PolyBLEP + tanh limit |
 | CALL ERR       |  ✅  |  ✅  | Line is real; severity/code/err-num always 0 (stub) |
-| CALL SAY       |  🟡  |      | Speech: parses, calls weak `tiSay` (stage 1 stub). TMS5220 synth + spchrom.bin lookup land in stage 2 |
-| CALL SPGET     |  🟡  |      | Speech vocab fetch: parses, calls weak `tiSpget` (stage 1 stub). Returns 0 bytes until vocab table is wired |
+| CALL SAY       |  ✅  |  🟡  | TMS5220 LPC-10 synth (MAME port) + spchrom.bin vocab lookup + greedy multi-word matching + UHOH on miss. Some vocab entries with no silence preamble still sound garbled (see TODO.md) |
+| CALL SPGET     |  ✅  |  🟡  | Binary-tree lookup in spchrom.bin returns the raw LPC byte string. Known limit: output truncates at the first embedded 0x00 byte (var_table strings are null-terminated; real TI strings are length-prefixed) |
 | CALL INIT      |      |      | Memory Expansion init — no 9900 CPU emulation |
 | CALL LINK      |      |      | Assembly linkage — out of scope            |
 | CALL LOAD      |      |      | Memory poke — out of scope                 |
@@ -191,6 +191,11 @@ Status legend:
 | CALL SPEED     |  ✅  |  ✅  | µs/statement throttle: 0 native, ~285 XB, ~666 TI BASIC |
 | CALL PAIR      |  ✅  |  ✅  | Opens 30s BLE-HID pairing window                 |
 | CALL UNPAIR    |  ✅  |  ✅  | Forgets every bonded BLE peer                    |
+| CALL WIFI      |  ✅  |  ✅  | `CALL WIFI` prints status; `CALL WIFI(ssid$,pass$)` stores creds + connects; `CALL WIFI("forget"\|"on"\|"off")`. Creds persisted to NVS; host provides WiFi STA + HTTP file-manager on `web-file-manager` branch |
+| CALL VOLUME    |  🟡  |      | Master output level 0..30 (SN76489 scale: 0 loudest, 30 silent). Host strong overrides + NVS persistence implemented in `audio.cpp`; interpreter parser/dispatch not yet wired |
+| CALL SPVOL     |  🟡  |      | Speech-only level 0..30, separate from CALL VOLUME (lets users boost speech vs SN76489 voices). Same host/interpreter status as CALL VOLUME |
+| CALL GETVOLUME |  🟡  |      | Read current master volume into a numeric variable. Host done, interpreter pending |
+| CALL GETSPVOL  |  🟡  |      | Read current speech volume. Host done, interpreter pending |
 
 ---
 

@@ -3665,6 +3665,53 @@ static void processInput(const char* input)
 }
 
 // ---------------------------------------------------------------------------
+// SD lazy bring-up. Called from setup() once (initial mount) and again
+// from fio::ensureSdReady() whenever the card has been invalidated and
+// a caller needs it. The driver-level mount is idempotent enough that
+// calling SD_MMC.end() before begin() works for retries.
+// ---------------------------------------------------------------------------
+static bool tryInitSd()
+{
+  Serial.println("[SD] attempting mount: SD_MMC.begin(\"/sdcard\", 1-bit, no-format, 20MHz)...");
+  // Make sure any prior failed mount state is fully torn down so the
+  // next begin() reprobes the card from scratch.
+  SD_MMC.end();
+  bool ok = SD_MMC.begin("/sdcard", /*mode1bit=*/true,
+                          /*format_if_mount_failed=*/false,
+                          /*sdmmc_frequency=*/20000);
+  if (!ok)
+  {
+    Serial.println("[SD] mount FAILED. SD_MMC.begin returned false.");
+    Serial.println("[SD]   Common causes: no SENSOR add-on board attached,");
+    Serial.println("[SD]   no card inserted, wrong pin mapping, or unsupported card.");
+    fio::setSDFs(nullptr);
+    return false;
+  }
+  uint8_t cardType = SD_MMC.cardType();
+  uint64_t cardSize = SD_MMC.cardSize();
+  uint64_t totalBytes = SD_MMC.totalBytes();
+  uint64_t usedBytes  = SD_MMC.usedBytes();
+  const char* typeStr =
+      (cardType == CARD_NONE)  ? "NONE" :
+      (cardType == CARD_MMC)   ? "MMC"  :
+      (cardType == CARD_SD)    ? "SD"   :
+      (cardType == CARD_SDHC)  ? "SDHC" : "UNKNOWN";
+  Serial.printf("[SD] mount OK. type=%s size=%lluMB total=%lluKB used=%lluKB\n",
+                typeStr,
+                (unsigned long long)(cardSize / (1024ULL * 1024ULL)),
+                (unsigned long long)(totalBytes / 1024ULL),
+                (unsigned long long)(usedBytes / 1024ULL));
+  if (cardType == CARD_NONE || totalBytes == 0)
+  {
+    Serial.println("[SD] WARNING: mount returned OK but card reports no usable filesystem.");
+    Serial.println("[SD]   Common causes: card is exFAT (not FAT32), card needs reformat,");
+    Serial.println("[SD]   or card is physically present but the FS is corrupt.");
+  }
+  fio::setSDFs(&SD_MMC);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
 // Setup and main loop
 // ---------------------------------------------------------------------------
 
@@ -3701,46 +3748,26 @@ void setup()
   // present). GPIO43 gates SD power through a P-FET (AO3401A), so it's
   // ACTIVE LOW — drive it LOW to turn the SD slot on. GPIO43 is U0TXD by
   // default; with CDCOnBoot=cdc the UART is unused, so we can repurpose
-  // this pin freely. After SD_MMC.begin succeeds, hand the fs::FS pointer
-  // to file_io so the shared file_io header stays hardware-agnostic.
+  // this pin freely.
+  //
+  // Init is now lazy via fio::ensureSdReady(): we register the init +
+  // invalidate callbacks here, kick a first mount attempt, and then any
+  // future SD failure (card yanked, DMA mem alloc fail) drops g_sdOk to
+  // false and the NEXT access re-runs the init. Without the lazy
+  // pattern, a one-time failure leaves the card unreachable until
+  // reboot.
   pinMode(SD_PWR, OUTPUT);
   digitalWrite(SD_PWR, LOW);
   delay(50);
   SD_MMC.setPins(SD_CLK, SD_CMD, SD_D0);
-  Serial.println("[SD] attempting mount: SD_MMC.begin(\"/sdcard\", 1-bit, no-format, 20MHz)...");
-  bool sdOk = SD_MMC.begin("/sdcard", /*mode1bit=*/true,
-                            /*format_if_mount_failed=*/false,
-                            /*sdmmc_frequency=*/20000);
-  if (sdOk)
-  {
-    uint8_t cardType = SD_MMC.cardType();
-    uint64_t cardSize = SD_MMC.cardSize();
-    uint64_t totalBytes = SD_MMC.totalBytes();
-    uint64_t usedBytes  = SD_MMC.usedBytes();
-    const char* typeStr =
-        (cardType == CARD_NONE)  ? "NONE" :
-        (cardType == CARD_MMC)   ? "MMC"  :
-        (cardType == CARD_SD)    ? "SD"   :
-        (cardType == CARD_SDHC)  ? "SDHC" : "UNKNOWN";
-    Serial.printf("[SD] mount OK. type=%s size=%lluMB total=%lluKB used=%lluKB\n",
-                  typeStr,
-                  (unsigned long long)(cardSize / (1024ULL * 1024ULL)),
-                  (unsigned long long)(totalBytes / 1024ULL),
-                  (unsigned long long)(usedBytes / 1024ULL));
-    if (cardType == CARD_NONE || totalBytes == 0)
-    {
-      Serial.println("[SD] WARNING: mount returned OK but card reports no usable filesystem.");
-      Serial.println("[SD]   Common causes: card is exFAT (not FAT32), card needs reformat,");
-      Serial.println("[SD]   or card is physically present but the FS is corrupt.");
-    }
-    fio::setSDFs(&SD_MMC);
-  }
-  else
-  {
-    Serial.println("[SD] mount FAILED. SD_MMC.begin returned false.");
-    Serial.println("[SD]   Common causes: no SENSOR add-on board attached,");
-    Serial.println("[SD]   no card inserted, wrong pin mapping, or unsupported card.");
-  }
+
+  fio::setSDInitCallback([]() -> bool { return tryInitSd(); });
+  fio::setSDInvalidateCallback([]() {
+    Serial.println("[SD] invalidated. Re-init will fire on next access.");
+    SD_MMC.end();
+    fio::setSDFs(nullptr);
+  });
+  tryInitSd();
 
   // Restore any DSK<n> mounts from /mounts.cfg on LittleFS so that
   // `MOUNT` state survives reboots.

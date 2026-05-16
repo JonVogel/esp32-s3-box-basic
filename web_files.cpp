@@ -69,21 +69,21 @@ namespace webfiles
     });
 
     // /api/files?dev=FLASH | SDCARD | DSK1..DSK9 / DSKA..DSKZ
-    // Returns JSON: {"device":"FLASH","files":[{"name":"X","size":N},...]}
-    // or {"device":"...","error":"..."} on a problem. The front-end
-    // populates a table per device; this is the only file-listing path.
+    // Returns JSON:
+    //   {"device":"FLASH",
+    //    "volume":{"name":"FLASH","total":1572864,"free":1023488},
+    //    "files":[{"name":"X","size":N},...]}
+    // or {"device":"...","error":"..."} on a problem.
     s_server.on("/api/files", HTTP_GET, [](AsyncWebServerRequest* req) {
       String dev = req->hasParam("dev") ? req->getParam("dev")->value() : "FLASH";
-      // Use a chunked-response so we don't have to size a buffer ahead.
-      // The JSON we emit is small even on a full SD card (a few KB) so
-      // a String-based response would also work, but the chunked form
-      // avoids allocating the whole payload at once.
-      AsyncWebServerResponse* resp = nullptr;
 
-      // Enumerate into a String we then ship. Bounded by FIFO size of
-      // the underlying device; in practice <2 KB even for SD with
-      // hundreds of files. If this proves too memory-hungry we can
-      // refactor to true streaming later.
+      // Volume header fields filled per-device below, then emitted
+      // before the files array. Sizes are always reported in BYTES so
+      // the JS just divides by 1024 to display.
+      String volName;
+      uint64_t volTotal = 0;
+      uint64_t volFree  = 0;
+
       String body;
       body.reserve(2048);
       body += "{\"device\":\"";
@@ -116,6 +116,10 @@ namespace webfiles
       // but the same pattern applies for consistency.
       if (dev.equalsIgnoreCase("FLASH"))
       {
+        volName  = "FLASH";
+        volTotal = (uint64_t)LittleFS.totalBytes();
+        volFree  = volTotal - (uint64_t)LittleFS.usedBytes();
+
         File root = LittleFS.open("/");
         File f = root.openNextFile();
         while (f)
@@ -130,21 +134,55 @@ namespace webfiles
       }
       else if (dev.equalsIgnoreCase("SDCARD") || dev.equalsIgnoreCase("SD"))
       {
-        if (!fio::g_sdOk) { ok = false; error = "SD not present"; }
+        // ensureSdReady() runs the host's lazy SD-init callback if SD
+        // was invalidated (e.g. by an earlier sdmmc DMA-alloc failure
+        // racing with WiFi). Cheap no-op if SD is already up.
+        if (!fio::ensureSdReady()) { ok = false; error = "SD not present"; }
         else
         {
+          volName  = "SDCARD";
+          volTotal = SD_MMC.totalBytes();
+          volFree  = volTotal - SD_MMC.usedBytes();
+
           File root = SD_MMC.open("/");
-          File f = root.openNextFile();
-          while (f)
+          if (!root)
           {
-            const char* n = f.name();
-            bool hide = f.isDirectory() || n[0] == '.' ||
-                        strcasecmp(n, "System Volume Information") == 0;
-            if (!hide) appendFile(n, (long)f.size());
-            f.close();
-            f = root.openNextFile();
+            // totalBytes()/usedBytes() are cached from mount; open("/")
+            // drives a fresh sector read that fails on out-of-mem.
+            // Invalidate so the NEXT request retries from a clean
+            // slate rather than reporting an empty directory.
+            fio::notifySDFailure();
+            ok = false;
+            error = "SD read failed (low memory? try CALL WIFI(\"off\"))";
           }
-          root.close();
+          else
+          {
+            int seen = 0;
+            File f = root.openNextFile();
+            while (f)
+            {
+              const char* n = f.name();
+              bool hide = f.isDirectory() || n[0] == '.' ||
+                          strcasecmp(n, "System Volume Information") == 0;
+              if (!hide) appendFile(n, (long)f.size());
+              seen++;
+              f.close();
+              f = root.openNextFile();
+            }
+            root.close();
+            // Diagnostic: if the cached used-bytes says the card has
+            // real content but we enumerated zero entries, the dir
+            // read silently failed (sdmmc out-of-mem returns an empty
+            // openNextFile chain). Surface it instead of claiming the
+            // card is empty.
+            if (seen == 0 && volTotal > 0 &&
+                (volTotal - volFree) > 64ULL * 1024ULL)
+            {
+              fio::notifySDFailure();
+              ok = false;
+              error = "SD read failed (low memory? try CALL WIFI(\"off\"))";
+            }
+          }
         }
       }
       else if (dev.length() >= 4 &&
@@ -157,6 +195,18 @@ namespace webfiles
         if (!img) { ok = false; error = "not mounted"; }
         else
         {
+          // Pull volume name + sizes from the VIB. The 10-char volume
+          // name is space-padded in the on-disk format; trim trailing
+          // spaces so the UI shows "WORK" not "WORK      ".
+          const dsk::Vib& v = img->vib();
+          char vn[11];
+          strncpy(vn, v.name, 10);
+          vn[10] = '\0';
+          for (int j = 9; j >= 0 && vn[j] == ' '; j--) vn[j] = '\0';
+          volName  = vn;
+          volTotal = (uint64_t)v.totalSectors * 256ULL;
+          volFree  = (uint64_t)img->freeSectors() * 256ULL;
+
           dsk::DskImage::CatEntry ents[64];
           int n = img->listCatalog(ents, 64);
           for (int i = 0; i < n; i++)
@@ -187,7 +237,26 @@ namespace webfiles
       }
       else
       {
-        body += "]}";
+        // Close the files array and append the volume object after it.
+        // Order doesn't matter for JSON consumers; placing it last keeps
+        // the streaming-append in the file loop above untouched.
+        body += "],\"volume\":{\"name\":\"";
+        for (const char* p = volName.c_str(); *p; ++p)
+        {
+          if (*p == '"' || *p == '\\') body += '\\';
+          body += *p;
+        }
+        // Emit as 64-bit literals via snprintf so SD cards > 4 GB don't
+        // wrap. String(uint32_t) would truncate a 64 GB card's total
+        // bytes silently.
+        char numbuf[32];
+        body += "\",\"total\":";
+        snprintf(numbuf, sizeof(numbuf), "%llu", (unsigned long long)volTotal);
+        body += numbuf;
+        body += ",\"free\":";
+        snprintf(numbuf, sizeof(numbuf), "%llu", (unsigned long long)volFree);
+        body += numbuf;
+        body += "}}";
       }
       req->send(200, "application/json", body);
     });
@@ -221,23 +290,35 @@ namespace webfiles
         "<option>DSK1</option><option>DSK2</option><option>DSK3</option>"
         "</select></label> "
         "<button onclick=refresh()>Refresh</button>"
+        "<div class=muted id=volinfo></div>"
         "<span class=muted id=status></span>"
         "<table id=ftbl><thead><tr><th>Name</th><th>Size</th></tr>"
         "</thead><tbody></tbody></table>"
         "<script>"
+        "function fmt(n){"  // human-readable byte sizes
+        "if(n<1024)return n+' B';"
+        "if(n<1048576)return (n/1024).toFixed(1)+' KB';"
+        "if(n<1073741824)return (n/1048576).toFixed(1)+' MB';"
+        "return (n/1073741824).toFixed(2)+' GB';}"
         "async function refresh(){"
         "const d=document.getElementById('dev').value;"
         "const s=document.getElementById('status');"
+        "const vi=document.getElementById('volinfo');"
         "const tb=document.querySelector('#ftbl tbody');"
-        "tb.innerHTML='';s.textContent='loading...';"
+        "tb.innerHTML='';vi.textContent='';s.textContent='loading...';"
         "try{"
         "const r=await fetch('/api/files?dev='+encodeURIComponent(d));"
         "const j=await r.json();"
         "if(j.error){s.innerHTML='<span class=err>'+j.error+'</span>';return;}"
+        "if(j.volume){"
+        "const used=j.volume.total-j.volume.free;"
+        "vi.textContent='Volume: '+j.volume.name+"
+        "' — '+fmt(used)+' used of '+fmt(j.volume.total)+"
+        "' ('+fmt(j.volume.free)+' free)';}"
         "s.textContent=j.files.length+' file(s)';"
         "for(const f of j.files){"
         "const tr=document.createElement('tr');"
-        "tr.innerHTML='<td>'+f.name+'</td><td>'+f.size+'</td>';"
+        "tr.innerHTML='<td>'+f.name+'</td><td>'+fmt(f.size)+'</td>';"
         "tb.appendChild(tr);"
         "}}catch(e){s.innerHTML='<span class=err>'+e+'</span>';}}"
         "document.getElementById('dev').onchange=refresh;"
