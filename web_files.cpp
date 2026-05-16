@@ -109,6 +109,11 @@ namespace webfiles
       bool ok = true;
       String error;
 
+      // CRITICAL: each File from openNextFile must be closed before the
+      // next call. The SD_MMC FAT layer has a 5-slot handle pool (default
+      // maxOpenFiles=5), and leaking handles exhausts it after ~5 entries —
+      // subsequent SD opens then silently fail. LittleFS is more forgiving
+      // but the same pattern applies for consistency.
       if (dev.equalsIgnoreCase("FLASH"))
       {
         File root = LittleFS.open("/");
@@ -118,8 +123,10 @@ namespace webfiles
           const char* n = f.name();
           bool hide = f.isDirectory() || n[0] == '.';
           if (!hide) appendFile(n, (long)f.size());
+          f.close();
           f = root.openNextFile();
         }
+        root.close();
       }
       else if (dev.equalsIgnoreCase("SDCARD") || dev.equalsIgnoreCase("SD"))
       {
@@ -134,8 +141,10 @@ namespace webfiles
             bool hide = f.isDirectory() || n[0] == '.' ||
                         strcasecmp(n, "System Volume Information") == 0;
             if (!hide) appendFile(n, (long)f.size());
+            f.close();
             f = root.openNextFile();
           }
+          root.close();
         }
       }
       else if (dev.length() >= 4 &&

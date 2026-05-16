@@ -42,6 +42,7 @@
 #include "ble_keyboard.h"
 #include "exec_manager.h"
 #include "file_io.h"
+#include "program_io.h"
 #include "sprites.h"
 #include "line_editor.h"
 #include "web_files.h"
@@ -1880,11 +1881,101 @@ static void cmdBye()
   ESP.restart();
 }
 
+// LineSource / LineSink bridges from progio:: to our ExecManager.
+// Used by cmdSave / cmdOld on the DSK target path (which needs V9T9
+// PROGRAM-format binary instead of text .bas files). Function pointers
+// can't capture state, so these reach into the file-scope `em` global.
+// Strip any trailing TOK_EOL terminator from the token stream so the
+// library writes the V9T9-correct [length][toks][0x00] layout — TI
+// PROGRAM format uses 0x00 as the line terminator, not our internal
+// TOK_EOL marker.
+static int progSrcCount() { return em.programSize(); }
+static void progSrcGet(int idx, int* outLineNum,
+                       const uint8_t** outToks, int* outLen)
+{
+  ProgramLine* line = em.getLine(idx);
+  *outLineNum = line->lineNum;
+  *outToks    = line->tokens;
+  int len = line->length;
+  if (len > 0 && line->tokens[len - 1] == TOK_EOL) len--;
+  *outLen     = len;
+}
+static const progio::LineSource PROG_SRC = { progSrcCount, progSrcGet };
+
+static void progDstClear() { em.clearProgram(); }
+static void progDstStore(int lineNum, const uint8_t* toks, int len)
+{
+  // ExecManager wants TOK_EOL terminated. The library strips 0x00 so
+  // we get bare tokens here; append our terminator before storing.
+  uint8_t lineToks[MAX_LINE_TOKENS];
+  if (len + 1 > MAX_LINE_TOKENS) return;
+  if (len > 0) memcpy(lineToks, toks, (size_t)len);
+  lineToks[len] = TOK_EOL;
+  em.storeLine(lineNum, lineToks, len + 1);
+}
+static const progio::LineSink PROG_DST = { progDstClear, progDstStore };
+
+// SAVE <spec>
+//   FLASH.NAME  / bare NAME    → text .bas in LittleFS
+//   SDCARD.NAME                → text .bas in SD_MMC
+//   DSKn.NAME                  → V9T9 PROGRAM binary in mounted .dsk
+//
+// Bare-name back-compat: pre-routing programs used `SAVE FOO` to save
+// to FLASH. progio::parseTarget defaults bare names to FLASH so those
+// still work.
 static void cmdSave(const char* filename)
 {
+  progio::Target tgt;
+  if (!progio::parseTarget(filename, tgt))
+  {
+    printError("* BAD FILE NAME");
+    return;
+  }
+
+  // DSK target — write V9T9 PROGRAM-format binary into the mounted image.
+  if (tgt.kind == progio::KIND_DSK)
+  {
+    dsk::DskImage* img = fio::dskImage(tgt.drive);
+    if (!img) { printError("* NOT MOUNTED"); return; }
+    if (img->readOnly()) { printError("* WRITE PROTECTED"); return; }
+    uint8_t* progBuf = (uint8_t*)malloc(8192);
+    if (!progBuf) { printError("* OUT OF MEMORY"); return; }
+    int size = progio::saveProgramBytes(PROG_SRC, progBuf, 8192);
+    if (size <= 0)
+    {
+      free(progBuf);
+      printError("* FILE ERROR");
+      return;
+    }
+    // 0x01 = PROGRAM file flag in V9T9 catalog entry. cmdDirOn's
+    // type-string formatter uses the same convention (e.g.->01 == "PROGRAM").
+    bool ok = img->writeRawFile(tgt.tiName, progBuf, size, 0x01);
+    free(progBuf);
+    if (!ok)
+    {
+      printError("* FILE ERROR");
+      return;
+    }
+    char msg[48];
+    snprintf(msg, sizeof(msg), "SAVED: DSK%c.%s (%d bytes)",
+             fio::driveToChar(tgt.drive), tgt.tiName, size);
+    printLine(msg);
+    return;
+  }
+
+  // FLASH or SDCARD — text .bas file.
+  fs::FS* fsRef = &LittleFS;
+  const char* devLabel = "FLASH";
+  if (tgt.kind == progio::KIND_SDCARD)
+  {
+    if (!fio::g_sdOk) { printError("* DEVICE NOT PRESENT"); return; }
+    fsRef = &SD_MMC;
+    devLabel = "SDCARD";
+  }
+
   char path[48];
-  snprintf(path, sizeof(path), "/%s.bas", filename);
-  File f = LittleFS.open(path, "w");
+  snprintf(path, sizeof(path), "/%s.bas", tgt.name);
+  File f = fsRef->open(path, "w");
   if (!f)
   {
     printError("* FILE ERROR");
@@ -1901,16 +1992,72 @@ static void cmdSave(const char* filename)
   }
   f.close();
 
-  char msg[48];
-  snprintf(msg, sizeof(msg), "SAVED: %s", path);
+  char msg[64];
+  snprintf(msg, sizeof(msg), "SAVED: %s%s", devLabel, path);
   printLine(msg);
 }
 
+// OLD <spec>
+//   FLASH.NAME / bare NAME    → load text .bas from LittleFS
+//   SDCARD.NAME               → load text .bas from SD_MMC
+//   DSKn.NAME                 → load V9T9 PROGRAM binary from .dsk image
+//
+// Smart .bas fallback applies to flat-fs targets: OLD FLASH.FOO finds
+// /FOO if it exists, else /FOO.bas. SAVE-created files (.bas extension)
+// load transparently from a bare name.
 static void cmdOld(const char* filename)
 {
+  progio::Target tgt;
+  if (!progio::parseTarget(filename, tgt))
+  {
+    printError("* BAD FILE NAME");
+    return;
+  }
+
+  if (tgt.kind == progio::KIND_DSK)
+  {
+    dsk::DskImage* img = fio::dskImage(tgt.drive);
+    if (!img) { printError("* NOT MOUNTED"); return; }
+    uint8_t* progBuf = (uint8_t*)malloc(8192);
+    if (!progBuf) { printError("* OUT OF MEMORY"); return; }
+    int size = img->readRawFile(tgt.tiName, progBuf, 8192);
+    if (size < 12)
+    {
+      free(progBuf);
+      printError("* FILE ERROR");
+      return;
+    }
+    bool ok = progio::loadProgramBytes(progBuf, size, PROG_DST,
+                                       MAX_LINE_TOKENS);
+    free(progBuf);
+    if (!ok)
+    {
+      printError("* BAD PROGRAM");
+      return;
+    }
+    char msg[48];
+    snprintf(msg, sizeof(msg), "LOADED: DSK%c.%s (%d lines)",
+             fio::driveToChar(tgt.drive), tgt.tiName, em.programSize());
+    printLine(msg);
+    return;
+  }
+
+  fs::FS* fsRef = &LittleFS;
+  const char* devLabel = "FLASH";
+  if (tgt.kind == progio::KIND_SDCARD)
+  {
+    if (!fio::g_sdOk) { printError("* DEVICE NOT PRESENT"); return; }
+    fsRef = &SD_MMC;
+    devLabel = "SDCARD";
+  }
+
   char path[48];
-  snprintf(path, sizeof(path), "/%s.bas", filename);
-  File f = LittleFS.open(path, "r");
+  if (!progio::resolveExistingPath(*fsRef, tgt.name, path, sizeof(path)))
+  {
+    printError("* FILE ERROR");
+    return;
+  }
+  File f = fsRef->open(path, "r");
   if (!f)
   {
     printError("* FILE ERROR");
@@ -1929,20 +2076,48 @@ static void cmdOld(const char* filename)
   }
   f.close();
 
-  char msg[48];
-  snprintf(msg, sizeof(msg), "LOADED: %s", path);
+  char msg[64];
+  snprintf(msg, sizeof(msg), "LOADED: %s%s", devLabel, path);
   printLine(msg);
 }
 
-// MERGE "filename" — load a text-format program from LittleFS and fold
-// its lines into the current program. Line-number collisions overwrite
-// (matching TI's MERGE behavior). Unlike OLD, the existing program
-// is NOT cleared first.
+// MERGE <spec> — load text-format lines from FLASH or SDCARD and fold
+// them into the current program. Line-number collisions overwrite
+// (matching TI's MERGE behavior). Unlike OLD, the existing program is
+// NOT cleared first. DSK targets are not supported — V9T9 PROGRAM
+// binaries are a whole-program format and can't be partially merged.
 static void cmdMerge(const char* filename)
 {
+  progio::Target tgt;
+  if (!progio::parseTarget(filename, tgt))
+  {
+    printError("* BAD FILE NAME");
+    return;
+  }
+
+  if (tgt.kind == progio::KIND_DSK)
+  {
+    // V9T9 PROGRAM format isn't line-text and can't be merged sensibly.
+    printError("* BAD FILE NAME");
+    return;
+  }
+
+  fs::FS* fsRef = &LittleFS;
+  const char* devLabel = "FLASH";
+  if (tgt.kind == progio::KIND_SDCARD)
+  {
+    if (!fio::g_sdOk) { printError("* DEVICE NOT PRESENT"); return; }
+    fsRef = &SD_MMC;
+    devLabel = "SDCARD";
+  }
+
   char path[48];
-  snprintf(path, sizeof(path), "/%s.bas", filename);
-  File f = LittleFS.open(path, "r");
+  if (!progio::resolveExistingPath(*fsRef, tgt.name, path, sizeof(path)))
+  {
+    printError("* FILE ERROR");
+    return;
+  }
+  File f = fsRef->open(path, "r");
   if (!f)
   {
     printError("* FILE ERROR");
@@ -1962,8 +2137,9 @@ static void cmdMerge(const char* filename)
   }
   f.close();
 
-  char msg[48];
-  snprintf(msg, sizeof(msg), "MERGED: %s (%d lines)", path, merged);
+  char msg[64];
+  snprintf(msg, sizeof(msg), "MERGED: %s%s (%d lines)",
+           devLabel, path, merged);
   printLine(msg);
 }
 
@@ -2069,10 +2245,27 @@ static void cmdDirOn(const char* device)
   catPrintLine(hdr);
 
   File root = fsRef->open("/");
+  if (!root)
+  {
+    // open("/") failed entirely — would be the SD filesystem not really
+    // mounted under the path we expect. Print a loud error rather than
+    // a misleading "(no files)" so the user knows the card-side is broken.
+    catPrintLine("  * CANNOT OPEN ROOT");
+    Serial.printf("[%s] cmdDirOn: open(\"/\") returned false\n", label);
+    return;
+  }
+  if (!root.isDirectory())
+  {
+    catPrintLine("  * ROOT NOT A DIRECTORY");
+    Serial.printf("[%s] cmdDirOn: open(\"/\") is not a directory\n", label);
+    return;
+  }
   File f = root.openNextFile();
   int shown = 0;
+  int total = 0;
   while (f && !g_catCancelled)
   {
+    total++;
     const char* name = f.name();
     bool hide = f.isDirectory() || name[0] == '.' ||
                 strcasecmp(name, "System Volume Information") == 0;
@@ -2083,9 +2276,25 @@ static void cmdDirOn(const char* device)
       catPrintLine(buf);
       shown++;
     }
+    f.close();   // CRITICAL: SD_MMC has a 5-slot file-handle pool by default;
+                 // leaking handles in this loop exhausts it on cards with
+                 // more than ~5 entries and subsequent SD opens silently fail.
     f = root.openNextFile();
   }
-  if (shown == 0) catPrintLine("  (no files)");
+  root.close();
+  if (shown == 0 && total == 0)
+  {
+    catPrintLine("  (root directory is empty)");
+  }
+  else if (shown == 0)
+  {
+    // We saw entries, but all of them were filtered out (dirs / dotfiles
+    // / Windows volume metadata). Tell the user explicitly so they don't
+    // think the listing is broken.
+    char buf[48];
+    snprintf(buf, sizeof(buf), "  (no files, %d hidden)", total);
+    catPrintLine(buf);
+  }
 }
 
 // Wrapper for the (currently unused) tokenized TOK_DIR path. Pre-tokenize
@@ -3480,34 +3689,63 @@ void setup()
     Serial.println("LittleFS mounted.");
   }
 
-  // Bring up SD card on the Box-3 SENSOR add-on board (if present).
-  // GPIO43 gates SD power through a P-FET (AO3401A), so it's ACTIVE LOW —
-  // drive it LOW to turn the SD slot on. GPIO43 is U0TXD by default; with
-  // CDCOnBoot=cdc the UART is unused, so we can repurpose this pin freely.
-  // Init the SD-MMC peripheral here, then hand the fs::FS to file_io so
-  // the shared file_io header stays hardware-agnostic across projects.
+  // NOTE: SD card init has to come AFTER initDisplay() below. LovyanGFX's
+  // LGFX_AUTODETECT probes board signatures in a way that breaks the
+  // SDMMC VFS mount even though the card itself stays present. Running
+  // SD_MMC.begin() afterward avoids the rescue dance entirely.
+
+  initDisplay();
+  initAudio();
+
+  // Now safe to bring up the SD card on the Box-3 SENSOR add-on (if
+  // present). GPIO43 gates SD power through a P-FET (AO3401A), so it's
+  // ACTIVE LOW — drive it LOW to turn the SD slot on. GPIO43 is U0TXD by
+  // default; with CDCOnBoot=cdc the UART is unused, so we can repurpose
+  // this pin freely. After SD_MMC.begin succeeds, hand the fs::FS pointer
+  // to file_io so the shared file_io header stays hardware-agnostic.
   pinMode(SD_PWR, OUTPUT);
   digitalWrite(SD_PWR, LOW);
   delay(50);
   SD_MMC.setPins(SD_CLK, SD_CMD, SD_D0);
-  if (SD_MMC.begin("/sdcard", /*mode1bit=*/true,
-                   /*format_if_mount_failed=*/false,
-                   /*sdmmc_frequency=*/20000))
+  Serial.println("[SD] attempting mount: SD_MMC.begin(\"/sdcard\", 1-bit, no-format, 20MHz)...");
+  bool sdOk = SD_MMC.begin("/sdcard", /*mode1bit=*/true,
+                            /*format_if_mount_failed=*/false,
+                            /*sdmmc_frequency=*/20000);
+  if (sdOk)
   {
+    uint8_t cardType = SD_MMC.cardType();
+    uint64_t cardSize = SD_MMC.cardSize();
+    uint64_t totalBytes = SD_MMC.totalBytes();
+    uint64_t usedBytes  = SD_MMC.usedBytes();
+    const char* typeStr =
+        (cardType == CARD_NONE)  ? "NONE" :
+        (cardType == CARD_MMC)   ? "MMC"  :
+        (cardType == CARD_SD)    ? "SD"   :
+        (cardType == CARD_SDHC)  ? "SDHC" : "UNKNOWN";
+    Serial.printf("[SD] mount OK. type=%s size=%lluMB total=%lluKB used=%lluKB\n",
+                  typeStr,
+                  (unsigned long long)(cardSize / (1024ULL * 1024ULL)),
+                  (unsigned long long)(totalBytes / 1024ULL),
+                  (unsigned long long)(usedBytes / 1024ULL));
+    if (cardType == CARD_NONE || totalBytes == 0)
+    {
+      Serial.println("[SD] WARNING: mount returned OK but card reports no usable filesystem.");
+      Serial.println("[SD]   Common causes: card is exFAT (not FAT32), card needs reformat,");
+      Serial.println("[SD]   or card is physically present but the FS is corrupt.");
+    }
     fio::setSDFs(&SD_MMC);
-    Serial.println("SD card mounted.");
   }
   else
   {
-    Serial.println("SD card mount failed (no SENSOR board, or no card inserted).");
+    Serial.println("[SD] mount FAILED. SD_MMC.begin returned false.");
+    Serial.println("[SD]   Common causes: no SENSOR add-on board attached,");
+    Serial.println("[SD]   no card inserted, wrong pin mapping, or unsupported card.");
   }
 
   // Restore any DSK<n> mounts from /mounts.cfg on LittleFS so that
   // `MOUNT` state survives reboots.
   loadMounts();
 
-  initDisplay();
-  initAudio();
   // Restore font mode from NVS so `CALL CHARSET("TI")` survives reboot.
   {
     Preferences prefs;
