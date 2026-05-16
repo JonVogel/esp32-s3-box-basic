@@ -135,15 +135,22 @@ static int16_t  g_speech_curr = 0;       // current  native 8 kHz sample
 //
 //   g_vol_master: maps linearly to the ES8311 reg 0x32 attenuator at
 //                 -1.5 dB per step. n=0 → 0xBF (0 dB), n=30 → 0x83 (-30 dB).
-//   g_speech_mix: maps to a float mixer multiplier. n=0 → 2.0× (loud),
-//                 n=15 → 1.0× (unity), n=30 → 0.0× (silent).
+//   g_speech_mix: maps to a float mixer multiplier. n=0 → 5.0× (loud),
+//                 n=15 → 2.5× (mid), n=30 → 0.0× (silent). Higher than
+//                 the 2.0× we started with: empirically the TMS5220's
+//                 lattice output is small enough that even ±32767-peak
+//                 samples sit deep in the tanh limiter's linear region,
+//                 so they never get the perceptual loudness boost that
+//                 CALL SOUND's full-scale squares get from being mildly
+//                 compressed. Pushing speech harder lets it reach the
+//                 tanh knee, which closes most of the gap.
 //
 // Loaded from NVS at initAudio(); CALL VOLUME / CALL SPVOL update both
 // the live values and the NVS-persisted store. Defaults if no NVS entry:
 // master=0 (loudest, matches the codec setting we hard-coded for boot),
 // speech=0 (loudest, matches the 2.0× mixer we shipped in d2edc7e).
 static volatile int   g_vol_master  = 0;
-static volatile float g_speech_mix  = 2.0f;
+static volatile float g_speech_mix  = 5.0f;
 
 // Forward declaration so initAudio() can call this; definition lives
 // alongside the other volume helpers at the end of the file.
@@ -664,7 +671,7 @@ void tiSetSpeechVolume(int n)
   if (n > 30) n = 30;
   // Linear 0..30 → 2.0..0.0× mixer multiplier. Half-scale (n=15) lands
   // at the unity 1.0× point so users have a clear "default" feel.
-  float gain = 2.0f * (1.0f - (float)n / 30.0f);
+  float gain = 5.0f * (1.0f - (float)n / 30.0f);
   portENTER_CRITICAL(&g_audio_mux);
   g_speech_mix = gain;
   portEXIT_CRITICAL(&g_audio_mux);
@@ -679,7 +686,7 @@ void tiGetSpeechVolume(int* out)
   if (!out) return;
   // Reverse the linear map. Round to nearest integer for cleanliness.
   float g = g_speech_mix;
-  int n = (int)(30.0f * (1.0f - g / 2.0f) + 0.5f);
+  int n = (int)(30.0f * (1.0f - g / 5.0f) + 0.5f);
   if (n < 0)  n = 0;
   if (n > 30) n = 30;
   *out = n;
@@ -705,6 +712,6 @@ static void loadVolumeFromNvs()
   }
   if (hasSpeech)
   {
-    g_speech_mix = 2.0f * (1.0f - (float)speech / 30.0f);
+    g_speech_mix = 5.0f * (1.0f - (float)speech / 30.0f);
   }
 }
