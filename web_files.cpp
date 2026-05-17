@@ -74,6 +74,71 @@ namespace webfiles
     //    "volume":{"name":"FLASH","total":1572864,"free":1023488},
     //    "files":[{"name":"X","size":N},...]}
     // or {"device":"...","error":"..."} on a problem.
+    // /api/devices — enumerate currently-available devices for the
+    // device-picker dropdown. FLASH is always present (it's the
+    // firmware's own FS), SDCARD only if SD is mounted, and DSK<n>
+    // entries only for mounted slots. Each entry returns:
+    //   {"id":"DSK1","label":"DSK1 (WIFIDSK)"}
+    // so the dropdown can show the volume name where applicable.
+    s_server.on("/api/devices", HTTP_GET, [](AsyncWebServerRequest* req) {
+      String body;
+      body.reserve(512);
+      body += "{\"devices\":[";
+      bool first = true;
+      auto addDev = [&](const char* id, const char* label) {
+        if (!first) body += ',';
+        first = false;
+        body += "{\"id\":\"";
+        body += id;
+        body += "\",\"label\":\"";
+        for (const char* p = label; *p; ++p)
+        {
+          if (*p == '"' || *p == '\\') body += '\\';
+          body += *p;
+        }
+        body += "\"}";
+      };
+
+      addDev("FLASH", "FLASH");
+      // Check g_sdOk directly — DO NOT call ensureSdReady() here.
+      // ensureSdReady() can synchronously run SD_MMC.end() + begin()
+      // (hundreds of ms of blocking work), which starves the
+      // AsyncTCP task and tanks subsequent connections. The /api/files
+      // SDCARD branch is the right place for a lazy SD probe, since
+      // that's where the user has actually requested an SD-touching
+      // operation.
+      if (fio::g_sdOk) addDev("SDCARD", "SDCARD");
+
+      // Mounted DSK<n> drives. drive index 1..MAX_DSK maps to
+      // DSK1..DSK9 / DSKA..DSKZ via driveToChar().
+      for (int d = 1; d <= fio::MAX_DSK; d++)
+      {
+        if (!fio::g_mounts[d].mounted) continue;
+        char id[8];
+        snprintf(id, sizeof(id), "DSK%c", fio::driveToChar(d));
+        // Best-effort volume-name suffix; falls back to bare id if the
+        // image isn't readable for some reason.
+        dsk::DskImage* img = fio::dskImage(d);
+        char label[32];
+        if (img)
+        {
+          char vn[11];
+          strncpy(vn, img->vib().name, 10);
+          vn[10] = '\0';
+          for (int j = 9; j >= 0 && vn[j] == ' '; j--) vn[j] = '\0';
+          if (vn[0]) snprintf(label, sizeof(label), "%s (%s)", id, vn);
+          else       snprintf(label, sizeof(label), "%s", id);
+        }
+        else
+        {
+          snprintf(label, sizeof(label), "%s", id);
+        }
+        addDev(id, label);
+      }
+      body += "]}";
+      req->send(200, "application/json", body);
+    });
+
     s_server.on("/api/files", HTTP_GET, [](AsyncWebServerRequest* req) {
       String dev = req->hasParam("dev") ? req->getParam("dev")->value() : "FLASH";
 
@@ -285,11 +350,8 @@ namespace webfiles
         ".muted{color:#789;font-size:.9em;}"
         "</style></head><body>"
         "<h1>TI Extended BASIC &mdash; File Browser</h1>"
-        "<label>Device: <select id=dev>"
-        "<option>FLASH</option><option>SDCARD</option>"
-        "<option>DSK1</option><option>DSK2</option><option>DSK3</option>"
-        "</select></label> "
-        "<button onclick=refresh()>Refresh</button>"
+        "<label>Device: <select id=dev></select></label> "
+        "<button onclick=refreshAll()>Refresh</button>"
         "<div class=muted id=volinfo></div>"
         "<span class=muted id=status></span>"
         "<table id=ftbl><thead><tr><th>Name</th><th>Size</th></tr>"
@@ -321,8 +383,31 @@ namespace webfiles
         "tr.innerHTML='<td>'+f.name+'</td><td>'+fmt(f.size)+'</td>';"
         "tb.appendChild(tr);"
         "}}catch(e){s.innerHTML='<span class=err>'+e+'</span>';}}"
+        // Populate the device dropdown from /api/devices on load. The
+        // Refresh button re-runs both — handy after mounting a DSK at
+        // the BASIC prompt so it appears in the dropdown without
+        // reloading the page.
+        "async function loadDevices(){"
+        "const sel=document.getElementById('dev');"
+        "const prev=sel.value;"
+        "try{"
+        "const r=await fetch('/api/devices');"
+        "const j=await r.json();"
+        "sel.innerHTML='';"
+        "for(const d of j.devices){"
+        "const o=document.createElement('option');"
+        "o.value=d.id;o.textContent=d.label;sel.appendChild(o);}"
+        "if(prev){"
+        "for(const o of sel.options){if(o.value===prev){sel.value=prev;break;}}}"
+        "}catch(e){"
+        "document.getElementById('status').innerHTML="
+        "'<span class=err>devices: '+e+'</span>';}}"
+        // refreshAll re-runs both endpoints; Refresh button uses this
+        // so a DSK mounted at the BASIC prompt becomes visible in the
+        // dropdown without a full page reload.
+        "async function refreshAll(){await loadDevices();await refresh();}"
         "document.getElementById('dev').onchange=refresh;"
-        "refresh();"
+        "refreshAll();"
         "</script></body></html>";
       req->send_P(200, "text/html", PAGE);
     });
