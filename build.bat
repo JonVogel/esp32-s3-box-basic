@@ -56,6 +56,17 @@ set "FQBN=esp32:esp32:esp32s3:PSRAM=opi,PartitionScheme=custom,FlashSize=16M,CDC
 set "SKETCH_DIR=%~dp0"
 if "!SKETCH_DIR:~-1!"=="\" set "SKETCH_DIR=!SKETCH_DIR:~0,-1!"
 
+REM AsyncTCP tuning. Defaults from mathieucarbou/Async_TCP:
+REM   CONFIG_ASYNC_TCP_STACK_SIZE = 16384  (per-task stack)
+REM   CONFIG_ASYNC_TCP_QUEUE_SIZE = 64     (event queue depth)
+REM These are #ifndef-guarded in AsyncTCP.h so we override via -D flags
+REM passed to compiler.cpp.extra_flags. We trim only the queue (saves
+REM ~2-3 KB DRAM); cutting the stack from 16K → 8K silently crashed
+REM the AsyncTCP task inside the accept callback chain (server stayed
+REM "listening" but rejected all real connections). Keep stack at the
+REM library default until we have measured headroom.
+set "EXTRA_FLAGS=-DCONFIG_ASYNC_TCP_QUEUE_SIZE=16"
+
 echo.
 echo === build.bat (esp32-s3-box-basic): action='!ACTION!' port='!PORT!' ===
 
@@ -71,7 +82,7 @@ goto compile_upload
 :compile
 echo.
 echo === Compiling ===
-arduino-cli compile --fqbn !FQBN! --libraries "!SKETCH_DIR!" "!SKETCH_DIR!"
+arduino-cli compile --fqbn !FQBN! --build-property "compiler.cpp.extra_flags=!EXTRA_FLAGS!" --build-property "compiler.c.extra_flags=!EXTRA_FLAGS!" --libraries "!SKETCH_DIR!" "!SKETCH_DIR!"
 goto end
 
 :upload
@@ -84,7 +95,7 @@ goto end
 :compile_upload
 echo.
 echo === Compiling ===
-arduino-cli compile --fqbn !FQBN! --libraries "!SKETCH_DIR!" "!SKETCH_DIR!"
+arduino-cli compile --fqbn !FQBN! --build-property "compiler.cpp.extra_flags=!EXTRA_FLAGS!" --build-property "compiler.c.extra_flags=!EXTRA_FLAGS!" --libraries "!SKETCH_DIR!" "!SKETCH_DIR!"
 if errorlevel 1 goto end
 echo.
 call :killmonitor
@@ -117,7 +128,7 @@ goto end
 :all
 echo.
 echo === Compiling ===
-arduino-cli compile --fqbn !FQBN! --libraries "!SKETCH_DIR!" "!SKETCH_DIR!"
+arduino-cli compile --fqbn !FQBN! --build-property "compiler.cpp.extra_flags=!EXTRA_FLAGS!" --build-property "compiler.c.extra_flags=!EXTRA_FLAGS!" --libraries "!SKETCH_DIR!" "!SKETCH_DIR!"
 if errorlevel 1 goto end
 echo.
 call :killmonitor
