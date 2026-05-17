@@ -100,14 +100,11 @@ namespace webfiles
       };
 
       addDev("FLASH", "FLASH");
-      // Check g_sdOk directly — DO NOT call ensureSdReady() here.
-      // ensureSdReady() can synchronously run SD_MMC.end() + begin()
-      // (hundreds of ms of blocking work), which starves the
-      // AsyncTCP task and tanks subsequent connections. The /api/files
-      // SDCARD branch is the right place for a lazy SD probe, since
-      // that's where the user has actually requested an SD-touching
-      // operation.
-      if (fio::g_sdOk) addDev("SDCARD", "SDCARD");
+      // SDCARD intentionally NOT advertised in this build — isolating
+      // the SD path for diagnostic purposes. If the web stays solid
+      // without SD, we know the SD touch (open("/"), readSector, etc.)
+      // is what's wedging AsyncTCP. Re-enable when we have a safer
+      // strategy (off-task SD probing, or sdkconfig DRAM headroom).
 
       // Mounted DSK<n> drives. drive index 1..MAX_DSK maps to
       // DSK1..DSK9 / DSKA..DSKZ via driveToChar().
@@ -199,11 +196,12 @@ namespace webfiles
       }
       else if (dev.equalsIgnoreCase("SDCARD") || dev.equalsIgnoreCase("SD"))
       {
-        // ensureSdReady() runs the host's lazy SD-init callback if SD
-        // was invalidated (e.g. by an earlier sdmmc DMA-alloc failure
-        // racing with WiFi). Cheap no-op if SD is already up.
-        if (!fio::ensureSdReady()) { ok = false; error = "SD not present"; }
-        else
+        // Temporarily disabled for diagnostic isolation. If the web
+        // server stays solid without ever touching SD, we know the
+        // SD enumeration path is what's wedging AsyncTCP.
+        ok = false;
+        error = "SDCARD disabled in this build (diagnostic)";
+        if (false)
         {
           volName  = "SDCARD";
           volTotal = SD_MMC.totalBytes();
@@ -409,7 +407,12 @@ namespace webfiles
         "document.getElementById('dev').onchange=refresh;"
         "refreshAll();"
         "</script></body></html>";
-      req->send_P(200, "text/html", PAGE);
+      // Send the page as a String. Verified working via curl: the
+      // 2.5 KB HTML/JS payload arrives intact in one HTTP/1.1 200
+      // response. send_P / chunked-callback both stalled earlier
+      // for reasons not fully understood; this is the known-good
+      // path on this fork.
+      req->send(200, "text/html", String(PAGE));
     });
 
     // 404 for anything else. Endpoints handled above: GET /, /api/status,
