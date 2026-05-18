@@ -2,6 +2,9 @@
 	"folders": [
 		{
 			"path": "."
+		},
+		{
+			"path": "../esp32-s3-box-basic-idf"
 		}
 	]
 }
